@@ -161,6 +161,33 @@ class Motor
    */
   virtual bool decode(const uint8_t data[8]) = 0;
 
+  /* ---------------- 反馈看门狗 ----------------
+   * 为什么不放在 decode() 里：本类要保持不依赖 tick/HAL，时间戳由 CAN 层传入。
+   * 为什么必须有：反馈一断，vel() 恒为 0，速度环会以为"轮子没转"而一直涨积分，
+   * 电调恢复的瞬间把轮子猛地打出去（现场实测 out_ 已经涨到 ±3500 还在涨）。
+   */
+
+  /**
+   * @brief       记录「刚收到一帧有效反馈」，在 CAN 层解包成功后调用
+   * @param       now_ms: 当前时刻，单位 ms
+   */
+  void NotifyFeedback(uint32_t now_ms) { last_rx_tick_ = now_ms; }
+
+  /** 上电后是否收到过任何反馈 */
+  bool HasFeedback(void) const { return last_rx_tick_ != 0u; }
+
+  /**
+   * @brief       反馈是否新鲜（看门狗判据）
+   * @param       now_ms:     当前时刻
+   * @param       timeout_ms: 允许的最大陈旧时间
+   * @retval      true = 在 timeout_ms 内收到过有效反馈
+   * @note        闭环前必须判这个：不新鲜就别积分、别给输出。
+   */
+  bool IsFeedbackFresh(uint32_t now_ms, uint32_t timeout_ms) const
+  {
+    return (last_rx_tick_ != 0u) && ((now_ms - last_rx_tick_) <= timeout_ms);
+  }
+
   /**
    * @brief       将期望输入编码为 8 字节 CAN 控制报文
    * @param        data: 输出的 8 字节 CAN 报文缓冲区
@@ -320,6 +347,7 @@ class Motor
   float curr_ = 0;            ///* 电机转子实际电流，单位：A
   float round_ = 0;           ///* 电机转子端累计圈数
   float last_raw_angle_ = 0;  ///* 电机上次角度原始值
+  uint32_t last_rx_tick_ = 0u; ///< 最近一次收到反馈的时刻(ms)，0 = 从未收到
   /** 电机输出端实际输出角度（未扣除角度偏差），单位：rad */
   float actual_angle_ = 0;
   MotorInfo motor_info_;  ///* 电机状态

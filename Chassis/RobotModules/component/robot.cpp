@@ -168,10 +168,30 @@ void Robot::GenerateCommands(float dt)
 
   /* 左摇杆：竖 → 前后，横 → 左右（右推为 −y，因为 y 轴指向左方）
    * 所有摇杆量先过死区，保证中位抖动不会变成残余速度（零输入即零输出） */
-  const float vx_cmd = ApplyStickDeadzone(rc_->rc_lv()) * lim.max_vx;
-  const float vy_cmd = -ApplyStickDeadzone(rc_->rc_lh()) * lim.max_vy;
+  const float lv_dz = ApplyStickDeadzone(rc_->rc_lv());
+  const float lh_dz = ApplyStickDeadzone(rc_->rc_lh());
+  const float rh_dz = ApplyStickDeadzone(rc_->rc_rh());
+
+  /* ---------- 上电武装互锁 ----------
+   * 实测踩过坑：电调恢复供电的瞬间底盘立刻进闭环，如果此时手上还压着摇杆
+   * （或刚做完云台测试），车会直接窜出去。所以要求三轴摇杆全部回中并保持
+   * kArmHoldMs 之后才允许输出；期间指令恒零。
+   * 急停 / 退出 Working 时 arm_ms_ 会被清零（见 OutputZero），下次进 Working 需重新武装。 */
+  constexpr float kArmHoldMs = 200.0f;
+  if ((lv_dz == 0.0f) && (lh_dz == 0.0f) && (rh_dz == 0.0f)) {
+    arm_ms_ += dt * 1000.0f;
+  } else {
+    arm_ms_ = 0.0f;
+  }
+  if (arm_ms_ < kArmHoldMs) {
+    command_.setZero();
+    return;
+  }
+
+  const float vx_cmd = lv_dz * lim.max_vx;
+  const float vy_cmd = -lh_dz * lim.max_vy;
   /* 右摇杆横向 → 原地转向（右推为顺时针，即负 w） */
-  const float w_stick = -ApplyStickDeadzone(rc_->rc_rh()) * lim.max_w;
+  const float w_stick = -rh_dz * lim.max_w;
 
   switch (mode_) {
     case ChassisMode::kFollow: {
@@ -212,9 +232,18 @@ void Robot::OutputWheels(float dt)
 
   const float radius = chassis_->ik_solver().geometry().wheel_radius;
   const hello_world::chassis_ik_solver::WheelVel& wheel = chassis_->wheel_vel();
+  const uint32_t now_ms = hello_world::tick::GetTickMs();
 
   for (uint8_t i = 0; i < kWheelCount; ++i) {
     if ((motors_[i] == nullptr) || (wheel_pids_[i] == nullptr)) {
+      continue;
+    }
+    /* 反馈看门狗：电调没反馈时 vel() 恒为 0，速度环会一路涨积分
+     * （现场实测 out_ 涨到 ±3500 还在涨），等电调恢复的瞬间四个轮子会猛冲。
+     * 所以反馈不新鲜就清积分、输出 0，等反馈恢复再重新入环。 */
+    if (!motors_[i]->IsFeedbackFresh(now_ms, kMotorFeedbackTimeoutMs)) {
+      wheel_pids_[i]->Reset();
+      motors_[i]->setInput(0.0f);
       continue;
     }
     /* 轮速 m/s → 轮子角速度 rad/s → 速度环 PID → 电流/转矩输入 */
@@ -227,6 +256,8 @@ void Robot::OutputWheels(float dt)
 void Robot::OutputZero(void)
 {
   command_.setZero();
+  /* 退出闭环就解除武装：再次进入 Working 必须重新「摇杆回中」才允许输出 */
+  arm_ms_ = 0.0f;
   if (chassis_ != nullptr) {
     chassis_->Stop();
   }

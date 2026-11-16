@@ -43,9 +43,11 @@ robot::GimbalLimits MakeGimbalLimits()
   robot::GimbalLimits lim;
   lim.pitch_min = -0.35f;     /* 待测：向下俯仰的机械极限（留 5° 余量） */
   lim.pitch_max = 0.60f;      /* 待测：向上抬升的机械极限（留 5° 余量） */
-  lim.max_yaw_rate = 6.0f;    /* 摇杆打满时的 yaw 角速度，rad/s */
-  lim.max_pitch_rate = 3.0f;  /* 摇杆打满时的 pitch 角速度，rad/s */
-  lim.max_torque = 1.0f;      /* 位置环转矩上限（首次试转临时限幅，改回 3.0；电机上限 7.5 N·m） */
+  /* ⚠️ 安全配置：整定前先用小速率、小转矩跑通，确认手感后再逐步放开。
+   *    2026-11-16 曾因 ki 过大 + 转矩上限 1.0 N·m 导致 yaw 失控飞转。 */
+  lim.max_yaw_rate = 2.0f;    /* 摇杆打满时的 yaw 角速度，rad/s（安全值；手感合适后可提到 6.0） */
+  lim.max_pitch_rate = 1.0f;  /* 摇杆打满时的 pitch 角速度，rad/s */
+  lim.max_torque = 0.25f;     /* 位置环转矩上限（安全值 0.25 N·m；能顶住重力，失手也不会飞车） */
   return lim;
 }
 
@@ -60,8 +62,10 @@ hello_world::pid::Pid::Config MakeYawConfig()
   cfg.kd = hello_world::tune::g_yaw_kd;
   cfg.out_min = -3.0f;
   cfg.out_max = 3.0f;
-  cfg.int_min = -1.0f;
-  cfg.int_max = 1.0f;
+  /* 积分限幅收紧到 ±0.15：即使以后把 ki 调大，积分也顶不出一股持续大转矩
+   * （2026-11-16 的失控就是积分把输出顶到饱和造成的） */
+  cfg.int_min = -0.15f;
+  cfg.int_max = 0.15f;
   return cfg;
 }
 
@@ -141,6 +145,6 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
  * 调参时用 J-Link 直接写这三个变量的内存即可，不用重新编译：
  *   mem32 <addr> 1   （内容是 IEEE-754 位模式）
  * 验收前请把最终值同步写回 MakeYawConfig() 的默认值。 */
-volatile float hello_world::tune::g_yaw_kp = 2.0f;
+volatile float hello_world::tune::g_yaw_kp = 1.5f;
 volatile float hello_world::tune::g_yaw_ki = 0.0f;
-volatile float hello_world::tune::g_yaw_kd = 0.35f;
+volatile float hello_world::tune::g_yaw_kd = 0.10f;

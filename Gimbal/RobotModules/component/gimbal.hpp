@@ -136,6 +136,23 @@ class Gimbal
     err_.yaw = AngleDiff(target_.yaw, yaw_feedback);
     err_.pitch = AngleDiff(target_.pitch, pitch_feedback);
 
+    /* ---------- 安全阀：误差过大时拒绝驱动 ----------
+     * 正常工作时位置误差应该是「度」级；一旦超过 kMaxTrackErr，说明目标与实际
+     * 严重不符（IMU 漂移/角度回绕/目标被外部写入/反馈异常）。此时如果继续按误差
+     * 输出，就是「越追越远」的飞车。这里直接清零输出并复位 PID，等误差回落再接管。
+     * ⚠️ 这是实机出现过云台失控后加的硬保护，不要删。 */
+    constexpr float kMaxTrackErr = 0.60f;  /* rad，约 34° */
+    if ((err_.yaw > kMaxTrackErr) || (err_.yaw < -kMaxTrackErr)) {
+      yaw_pid_.Reset();
+      err_.yaw = 0.0f;
+      output_.yaw = 0.0f;
+    }
+    if ((err_.pitch > kMaxTrackErr) || (err_.pitch < -kMaxTrackErr)) {
+      pitch_pid_.Reset();
+      err_.pitch = 0.0f;
+      output_.pitch = 0.0f;
+    }
+
     /* pitch 目标已在 SetTarget 里钳位；反馈越界时不再继续加油门 */
     if (pitch_feedback >= limits_.pitch_max && err_.pitch > 0.0f) {
       err_.pitch = 0.0f;

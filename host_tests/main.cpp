@@ -102,6 +102,11 @@ void TestStickDeadzone()
     prev = out;
   }
 
+  /* 死区边界：deadzone >= 1 时不能除零/变号 */
+  CHECK_NEAR(ApplyStickDeadzone(1.0f, 1.0f), 1.0f, 1e-3);
+  CHECK_NEAR(ApplyStickDeadzone(-1.0f, 1.0f), -1.0f, 1e-3);
+  CHECK_NEAR(ApplyStickDeadzone(0.0f, 2.0f), 0.0f, 1e-6);
+  CHECK_TRUE(std::isfinite(ApplyStickDeadzone(0.5f, 5.0f)));
   /* 超出量程要饱和，不能放大 */
   CHECK_NEAR(ApplyStickDeadzone(2.0f), 1.0f, 1e-6);
   CHECK_NEAR(ApplyStickDeadzone(-2.0f), -1.0f, 1e-6);

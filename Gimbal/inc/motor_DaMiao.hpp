@@ -293,6 +293,15 @@ class DaMiao : public Motor
   // 电机是否使能
   bool is_enabled(void) const { return dm_status_.is_enabled; }
 
+  /**
+   * @brief       请求重新使能（下一帧立即发出使能指令）
+   * @note        自动使能依赖 dm_status_.is_enabled，而它是「上一次收到的反馈」里的状态。
+   *              如果只给电机断过电、控制板没复位，这个值会是过期的 1，
+   *              于是 encode() 永远不发使能帧，电机就一直是失能 + 不发反馈的静默状态。
+   *              反馈超时的时候调用本函数即可自愈，不需要给整机断电。
+   */
+  void RequestEnable(void) { comm_data_.wait_to_handle_cmd = kEnable; }
+
   // 电机当前控制模式
   CtrlMode current_ctrl_mode(void) const { return dm_status_.current_ctrl_mode; }
 

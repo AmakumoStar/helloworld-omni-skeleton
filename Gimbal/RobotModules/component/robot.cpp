@@ -124,14 +124,24 @@ void Robot::UpdateInputs(void)
    * （pitch 硬件可能缺失）。判定用纯函数 MotorsReady()，与当前状态无关。 */
   bool motors_ok = (yaw_motor_ != nullptr) && (pitch_motor_ != nullptr);
   if (motors_ok) {
+    const uint32_t now_ms = hello_world::tick::GetTickMs();
+    /* ---------- 反馈超时 → 强制重新使能（自愈） ----------
+     * 只给电机断过电、控制板没复位时，dm_status_.is_enabled 会停留在过期的 1，
+     * 于是 encode() 不再发使能帧，电机就一直是「失能且不发反馈」的静默状态，
+     * 必须给整机断电才能恢复。这里在反馈超时的时候主动请求使能，把这条死路堵掉。 */
+    if (!AsDaMiao(yaw_motor_)->IsFeedbackFresh(now_ms, kMotorReadyTimeoutMs)) {
+      AsDaMiao(yaw_motor_)->RequestEnable();
+    }
+    if (!AsDaMiao(pitch_motor_)->IsFeedbackFresh(now_ms, kMotorReadyTimeoutMs)) {
+      AsDaMiao(pitch_motor_)->RequestEnable();
+    }
     const bool yaw_ok = AsDaMiao(yaw_motor_)->is_enabled();
     const bool pitch_ok = AsDaMiao(pitch_motor_)->is_enabled();
     /* 调试开关：只要求 yaw 使能（pitch 硬件没通时用）。
      * ⚠️ 验收必须为 false —— 考核要求两轴闭环。 */
     constexpr bool kRequireBothJoints = true;
     motors_ok = MotorsReady(yaw_ok, pitch_ok, kRequireBothJoints,
-                            hello_world::tick::GetTickMs(), boot_tick_,
-                            kMotorReadyTimeoutMs);
+                            now_ms, boot_tick_, kMotorReadyTimeoutMs);
   }
 
   inputs_.imu_ready = imu_ready;
@@ -234,16 +244,25 @@ void Robot::OutputMotors(void)
     return;
   }
 
+  /* 反馈看门狗：某一轴反馈断了就只把那一轴置零，另一轴照常工作
+   * （本车上 pitch 一直没反馈，若"任一轴断就全停"会把 yaw 也一起停掉）。
+   * 不加这个的话，反馈断了位置环会一直涨积分，恢复瞬间云台会猛地一甩。 */
+  const uint32_t now_ms = hello_world::tick::GetTickMs();
+
   if (yaw_motor_ != nullptr) {
+    const float torque = yaw_motor_->IsFeedbackFresh(now_ms, kMotorFeedbackTimeoutMs)
+                             ? gimbal_->output().yaw
+                             : 0.0f;
     /* kp = kd = 0 时 MIT 退化为纯转矩输出，与自写位置环配合使用 */
     AsDaMiao(yaw_motor_)->setMitInput(yaw_motor_->angle(), 0.0f,
-                                      gimbal_->mit_kp(), gimbal_->mit_kd(),
-                                      gimbal_->output().yaw);
+                                      gimbal_->mit_kp(), gimbal_->mit_kd(), torque);
   }
   if (pitch_motor_ != nullptr) {
+    const float torque = pitch_motor_->IsFeedbackFresh(now_ms, kMotorFeedbackTimeoutMs)
+                             ? gimbal_->output().pitch
+                             : 0.0f;
     AsDaMiao(pitch_motor_)->setMitInput(pitch_motor_->angle(), 0.0f,
-                                        gimbal_->mit_kp(), gimbal_->mit_kd(),
-                                        gimbal_->output().pitch);
+                                        gimbal_->mit_kp(), gimbal_->mit_kd(), torque);
   }
 }
 

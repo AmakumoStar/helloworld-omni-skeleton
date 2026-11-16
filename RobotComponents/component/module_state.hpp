@@ -10,7 +10,7 @@
  * @attention :
  *  1. 本文件被底盘板、云台板同时编译，只允许放「纯类型 / 枚举 / inline 函数」，
  *     严禁依赖 STM32 HAL、电机驱动或任何具体硬件。
- *  2. 全工程的单位约定（见 docs/units_and_protocol.md）：
+ *  2. 全工程的单位约定（见 docs/protocol.md）：
  *       - 速度 vx / vy：m/s      - 角速度 w：rad/s
  *       - 角度 yaw / pitch：rad  - 角度一律以「逆时针为正」（z 轴向上，右手法则）
  *  3. 坐标系约定：前进正方向恒为云台朝向。
@@ -178,6 +178,9 @@ inline float Clamp(float value, float lower, float upper)
   return value;
 }
 
+/** 电机反馈超时（ms）：超过这么久没收到反馈就判离线，闭环必须停手 */
+inline constexpr uint32_t kMotorFeedbackTimeoutMs = 50u;
+
 /** 摇杆死区半宽（归一化量） */
 inline constexpr float kStickDeadzone = 0.05f;
 
@@ -195,11 +198,13 @@ inline float ApplyStickDeadzone(float value, float deadzone = kStickDeadzone)
   if (deadzone <= 0.0f) {
     return v;
   }
-  if (v > deadzone) {
-    return (v - deadzone) / (1.0f - deadzone);
+  /* 防御：死区大于等于 1 时 (1 - deadzone) 会除零/变号，钳到 0.99 */
+  const float dz = (deadzone < 0.99f) ? deadzone : 0.99f;
+  if (v > dz) {
+    return (v - dz) / (1.0f - dz);
   }
-  if (v < -deadzone) {
-    return (v + deadzone) / (1.0f - deadzone);
+  if (v < -dz) {
+    return (v + dz) / (1.0f - dz);
   }
   return 0.0f;
 }

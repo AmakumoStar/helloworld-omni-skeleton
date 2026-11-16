@@ -11,7 +11,7 @@
  *  1. 两块板各实例化一个对象，用 CodePart 决定编解码方向：
  *       CodePart::Chassis → encode 打包 ChassisData（C2G），decode 解 GimbalData（G2C）
  *       CodePart::Gimbal  → encode 打包 GimbalData（G2C），decode 解 ChassisData（C2G）
- *  2. 报文字段与缩放比例见 docs/units_and_protocol.md；两端必须严格一致。
+ *  2. 报文字段与缩放比例见 docs/protocol.md；两端必须严格一致。
  *  3. 浮点量一律按「先乘比例、再四舍五入、再饱和到 int16」处理，收发对称。
  *******************************************************************************
  *  Copyright (c) 2024 Hello World Team, Zhejiang University.

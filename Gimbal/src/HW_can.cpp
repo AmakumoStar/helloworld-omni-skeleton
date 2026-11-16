@@ -22,6 +22,7 @@
 #include "can.h"
 #include "gimbal_chassis_comm.hpp"
 #include "ins_all.hpp"
+#include "tick.hpp"
 #include "motor.hpp"
 #include "motor_DaMiao.hpp"
 
@@ -83,7 +84,10 @@ static void RouteRxFrame(uint8_t bus, uint32_t std_id, const uint8_t* data)
       continue;
     }
     if (hello_world::motor::DaMiao::GetRxId(joints[i]->id()) == std_id) {
-      (void)joints[i]->decode(data);
+      if (joints[i]->decode(data)) {
+        /* 反馈看门狗：闭环前用 IsFeedbackFresh() 判断，断了就不许积分 */
+        joints[i]->NotifyFeedback(hello_world::tick::GetTickMs());
+      }
       return;
     }
   }
@@ -141,25 +145,45 @@ void CAN_Send_Msg(CAN_HandleTypeDef* hcan, uint8_t* msg, uint32_t id, uint8_t le
 /**
  * @brief   CAN1 FIFO0 接收中断回调
  */
+/**
+ * @brief   接收回调：两路 CAN × 两个 FIFO 都要处理
+ * @note    ⚠️ 不要按「CAN1 只用 FIFO0、CAN2 只用 FIFO1」来写死。
+ *          滤波器寄存器属于 CAN1 的寄存器区，只有在 CAN1 处于初始化模式时才写得进；
+ *          初始化顺序一旦不对，某些 bank 的 FIFO 分配会退回默认值（FIFO0），
+ *          帧就会进到我们没处理的 FIFO 里，现象是「总线有帧、我们一帧都收不到」。
+ *          这里把四种组合全部兜住，从哪个 FIFO 出来都能正确分发。
+ */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 {
   if (hcan == &hcan1) {
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header1, can1_rx_data) == HAL_OK) {
       RouteRxFrame(0u, rx_header1.StdId, can1_rx_data);
     }
+  } else if (hcan == &hcan2) {
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header2, can2_rx_data) == HAL_OK) {
+      RouteRxFrame(1u, rx_header2.StdId, can2_rx_data);
+    }
+  } else {
+    return;
   }
   (void)HAL_CAN_ActivateNotification(hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
 }
 
 /**
- * @brief   CAN2 FIFO1 接收中断回调
+ * @brief   FIFO1 接收回调（同样两路都处理）
  */
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef* hcan)
 {
-  if (hcan == &hcan2) {
+  if (hcan == &hcan1) {
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header1, can1_rx_data) == HAL_OK) {
+      RouteRxFrame(0u, rx_header1.StdId, can1_rx_data);
+    }
+  } else if (hcan == &hcan2) {
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header2, can2_rx_data) == HAL_OK) {
       RouteRxFrame(1u, rx_header2.StdId, can2_rx_data);
     }
+  } else {
+    return;
   }
   (void)HAL_CAN_ActivateNotification(hcan, CAN_IT_RX_FIFO1_MSG_PENDING);
 }

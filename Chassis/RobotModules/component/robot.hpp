@@ -142,6 +142,9 @@ class Robot
   float delta_ = 0.0f;     ///< 云台相对车头的偏航角
   bool estop_ = false;     ///< 急停档（最外层判定）
   uint32_t ready_tick_ = 0;  ///< 进入 Resurrection 的时刻，用于电机使能超时
+  /* 上电武装计时（ms）：三轴摇杆回中并保持 kArmHoldMs 后才允许输出。
+   * 目的：防止「带着摇杆上电」时底盘立刻窜车——实机踩过这个坑。 */
+  float arm_ms_ = 0.0f;
 
   /* 跟随模式 PID（w 由「云台朝向 − 车头朝向」闭环给出） */
   hello_world::pid::Pid follow_pid_{};
