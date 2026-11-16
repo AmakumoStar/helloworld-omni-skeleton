@@ -41,7 +41,7 @@ constexpr float kControlPeriodS = 0.001f;
 constexpr float kWheelRadiusM = 0.07786f;    /* 轮半径 R */
 constexpr float kHalfWheelbaseM = 0.15338f;  /* 半轴距 W/2 = 前后距离/2 */
 constexpr float kHalfTrackM = 0.15338f;      /* 半轮距 L/2 = 左右距离/2 */
-constexpr float kMaxWheelVelMps = 1.0f;   /* 单轮线速度上限（首次试转临时限幅，改回 4.5） */
+constexpr float kMaxWheelVelMps = 0.5f;   /* 单轮线速度上限（首次试转临时限幅，改回 4.5） */
 
 /* 跟随环 PID（w 由「云台朝向 − 车头朝向」闭环给出） */
 hello_world::pid::Pid::Config MakeFollowConfig()

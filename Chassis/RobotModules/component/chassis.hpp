@@ -31,10 +31,10 @@ namespace robot
 
 /** 底盘指令限幅（数值待实机标定，先给保守值） */
 struct ChassisLimits {
-  float max_vx = 0.6f;      ///< 前后最大线速度，m/s（首次试转临时限幅，验收前改回 3.0）
-  float max_vy = 0.6f;      ///< 左右最大线速度，m/s（同上）
-  float max_w = 2.0f;       ///< 分离 / 跟随模式最大角速度，rad/s（同上，改回 6.0）
-  float max_spin_w = 2.0f;  ///< 小陀螺最大自旋角速度，rad/s（同上，改回 8.0）
+  float max_vx = 0.25f;      ///< 前后最大线速度，m/s（首次试转临时限幅，验收前改回 3.0）
+  float max_vy = 0.25f;      ///< 左右最大线速度，m/s（同上）
+  float max_w = 0.5f;       ///< 分离 / 跟随模式最大角速度，rad/s（同上，改回 6.0）
+  float max_spin_w = 0.5f;  ///< 小陀螺最大自旋角速度，rad/s（同上，改回 8.0）
 };
 
 /* Exported types ------------------------------------------------------------*/

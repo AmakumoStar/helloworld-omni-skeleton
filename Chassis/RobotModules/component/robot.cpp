@@ -30,6 +30,15 @@ namespace
 constexpr uint8_t kWheelCount = hello_world::chassis_ik_solver::kWheelCount;
 }  // namespace
 
+/* ---------- 台架模式用的一致性变量（可用 J-Link 在线写） ----------
+ * 归一化量，实际指令 = 该值 × limits_ 上限。默认 0，上电不动。
+ *   g_bench_vx > 0 前进      g_bench_vy > 0 向左      g_bench_w > 0 逆时针自转
+ * g_bench_open_duty：开环直给电调的比例（0.1 = 10% 满量程），用于先验证转向。 */
+volatile float g_bench_vx = 0.0f;
+volatile float g_bench_vy = 0.0f;
+volatile float g_bench_w = 0.0f;
+volatile float g_bench_open_duty = 0.0f;
+
 /* Exported function definitions ---------------------------------------------*/
 
 void Robot::Update(float dt)
@@ -97,7 +106,16 @@ void Robot::UpdateInputs(void)
   /* ---- 遥控器 ---- */
   bool rc_online = (rc_ != nullptr) && (!rc_checker_.isOffline());
   bool estop_switch = false;
-  if (rc_ != nullptr) {
+  /* ---------- 台架模式：绕过遥控 ----------
+   * DBUS 解码还没修好（rc 恒 0），底盘会卡在 Dead、GenerateCommands 永不执行，
+   * 轮子完全动不了。打开台架模式后强制 rc 在线、清除急停，
+   * 让状态机能进 Working，速度指令改由 g_bench_* 提供（默认 0，上电不动）。
+   * ⚠️ 正式使用前必须把 kBenchTest 改回 false。 */
+  constexpr bool kBenchTest = false;
+  if (kBenchTest) {
+    rc_online = true;
+    estop_switch = false;
+  } else if (rc_ != nullptr) {
     estop_switch =
         (rc_->rc_l_switch() == hello_world::remote_control::kSwitchStateDown);
     /* 右拨杆选模式：Up = 分离，Mid = 跟随，Down = 小陀螺 */
@@ -128,13 +146,19 @@ void Robot::UpdateInputs(void)
   }
 
   /* ---- 双板通讯 ---- */
-  const bool peer_online = (comm_ != nullptr) && (!comm_->isOffline());
-  delta_ = peer_online ? comm_->gimbal_data().yaw : 0.0f;
+  const bool peer_online_raw = (comm_ != nullptr) && (!comm_->isOffline());
+  delta_ = peer_online_raw ? comm_->gimbal_data().yaw : 0.0f;
 
-  inputs_.imu_ready = imu_ready;
-  inputs_.motors_ready = motors_ok;
+  /* 台架模式：轮子测试用不到 IMU，一并绕过（正式使用必须改回） */
+  inputs_.imu_ready = kBenchTest ? true : imu_ready;
+  /* 台架模式：放开「四个电调都有反馈」这个总闸，让能工作的轮子先转起来，
+   * 便于定位到底是哪一个电调没反馈（单个轮子的保护仍由 OutputWheels 的看门狗负责）。
+   * 正式使用必须改回。 */
+  inputs_.motors_ready = kBenchTest ? true : motors_ok;
   inputs_.rc_online = rc_online;
-  inputs_.peer_online = peer_online;
+  /* 台架模式：云台板可能没通电/没连，peer 也要绕过，否则永远进不了 Working。
+   * 正式使用前必须把 kBenchTest 改回 false。 */
+  inputs_.peer_online = kBenchTest ? true : peer_online_raw;
   inputs_.estop = estop_switch;
 }
 
@@ -165,6 +189,19 @@ void Robot::GenerateCommands(float dt)
   }
 
   const ChassisLimits& lim = chassis_->limits();
+
+  /* ---------- 台架模式 ----------
+   * DBUS 解码还没修好（rc 恒 0），底盘进不了 Working，轮子完全动不了。
+   * 打开这个开关后：不看遥控、不看模式，直接用三个可在线写入的量驱动轮子，
+   * 便于验证「轮子转向 / 逆解 / 速度环」这些与遥控无关的部分。
+   * 默认全 0，上电不会动；用 J-Link 写 g_bench_* 即可让它转。 */
+  constexpr bool kBenchTest = false;
+  if (kBenchTest) {
+    command_.vx = g_bench_vx * lim.max_vx;
+    command_.vy = g_bench_vy * lim.max_vy;
+    command_.w = g_bench_w * lim.max_w;
+    return;
+  }
 
   /* 左摇杆：竖 → 前后，横 → 左右（右推为 −y，因为 y 轴指向左方）
    * 所有摇杆量先过死区，保证中位抖动不会变成残余速度（零输入即零输出） */

@@ -28,13 +28,16 @@ constexpr int kWheelCount = static_cast<int>(hello_world::chassis_ik_solver::kWh
 hello_world::pid::Pid::Config MakeWheelConfig()
 {
   hello_world::pid::Pid::Config cfg;
-  cfg.kp = 200.0f;      ///< 输出/（rad/s）
-  cfg.ki = 20.0f;       ///< 消除稳态误差
-  cfg.kd = 0.0f;        ///< 速度环一般不用 D
-  cfg.out_min = -16384.0f;
-  cfg.out_max = 16384.0f;
-  cfg.int_min = -8000.0f;
-  cfg.int_max = 8000.0f;
+  /* ⚠️ 保守整定起点（2026-11-16 云台失控的教训）：
+   * 先把 kp 压低、ki 归零，确认轮子能平稳转起来再逐步加。
+   * ki 一旦参与，电调丢反馈时积分会一路顶到限幅，恢复瞬间四轮猛冲。 */
+  cfg.kp = 50.0f;       ///< 输出/（rad/s）
+  cfg.ki = 0.0f;        ///< 先不加积分，避免饱和
+  cfg.kd = 0.0f;        ///< 速度环不用 D
+  cfg.out_min = -3000.0f;
+  cfg.out_max = 3000.0f;
+  cfg.int_min = -500.0f;
+  cfg.int_max = 500.0f;
   return cfg;
 }
 
