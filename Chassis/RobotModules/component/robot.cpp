@@ -33,11 +33,29 @@ constexpr uint8_t kWheelCount = hello_world::chassis_ik_solver::kWheelCount;
 /* ---------- 台架模式用的一致性变量（可用 J-Link 在线写） ----------
  * 归一化量，实际指令 = 该值 × limits_ 上限。默认 0，上电不动。
  *   g_bench_vx > 0 前进      g_bench_vy > 0 向左      g_bench_w > 0 逆时针自转
- * g_bench_open_duty：开环直给电调的比例（0.1 = 10% 满量程），用于先验证转向。 */
+ * g_bench_open_duty：开环直给电调的比例（0.1 = 10% 满量程），用于先验证转向。
+ *   非 0 时绕过速度环，四轮直给同一个电流 —— 这是区分「指令链问题」和「电调/接线问题」
+ *   最直接的一刀。 */
 volatile float g_bench_vx = 0.0f;
 volatile float g_bench_vy = 0.0f;
 volatile float g_bench_w = 0.0f;
 volatile float g_bench_open_duty = 0.0f;
+
+/* ===== 台架模式的开关：运行期可写，不用重编译 =====
+ * 为什么不再用 constexpr：改常量就得重编重烧，一次试验两分钟，还容易和板上固件错位。
+ * 现在的约定：
+ *   上电默认 0        → 台架模式关闭，rc/peer/imu/motors/estop 五个联锁全部有效
+ *   写 0x5A5A5A5A     → 打开；写别的值（包括手滑写的 1）一律不生效
+ *   复位/掉电自动恢复 → 不会"忘了关"
+ * ⚠️ 打开后车必须架空：它会绕过全部五个安全前提。 */
+volatile uint32_t g_bench_enable = 0u;
+constexpr uint32_t kBenchMagic = 0x5A5A5A5Au;
+
+namespace
+{
+/** 台架模式是否开启：魔数匹配才认，避免手滑写个 1 就把五个联锁全绕过了 */
+bool BenchOn(void) { return g_bench_enable == kBenchMagic; }
+}  // namespace
 
 /* Exported function definitions ---------------------------------------------*/
 
@@ -110,9 +128,9 @@ void Robot::UpdateInputs(void)
    * DBUS 解码还没修好（rc 恒 0），底盘会卡在 Dead、GenerateCommands 永不执行，
    * 轮子完全动不了。打开台架模式后强制 rc 在线、清除急停，
    * 让状态机能进 Working，速度指令改由 g_bench_* 提供（默认 0，上电不动）。
-   * ⚠️ 正式使用前必须把 kBenchTest 改回 false。 */
-  constexpr bool kBenchTest = false;
-  if (kBenchTest) {
+   * ⚠️ 开关是运行期的 g_bench_enable（写魔数才生效），复位自动关闭。 */
+  const bool bench = BenchOn();
+  if (bench) {
     rc_online = true;
     estop_switch = false;
   } else if (rc_ != nullptr) {
@@ -149,16 +167,14 @@ void Robot::UpdateInputs(void)
   const bool peer_online_raw = (comm_ != nullptr) && (!comm_->isOffline());
   delta_ = peer_online_raw ? comm_->gimbal_data().yaw : 0.0f;
 
-  /* 台架模式：轮子测试用不到 IMU，一并绕过（正式使用必须改回） */
-  inputs_.imu_ready = kBenchTest ? true : imu_ready;
+  /* 台架模式：轮子测试用不到 IMU，一并绕过（正式使用必须关掉台架模式） */
+  inputs_.imu_ready = bench ? true : imu_ready;
   /* 台架模式：放开「四个电调都有反馈」这个总闸，让能工作的轮子先转起来，
-   * 便于定位到底是哪一个电调没反馈（单个轮子的保护仍由 OutputWheels 的看门狗负责）。
-   * 正式使用必须改回。 */
-  inputs_.motors_ready = kBenchTest ? true : motors_ok;
+   * 便于定位到底是哪一个电调没反馈（单个轮子的保护仍由 OutputWheels 的看门狗负责）。 */
+  inputs_.motors_ready = bench ? true : motors_ok;
   inputs_.rc_online = rc_online;
-  /* 台架模式：云台板可能没通电/没连，peer 也要绕过，否则永远进不了 Working。
-   * 正式使用前必须把 kBenchTest 改回 false。 */
-  inputs_.peer_online = kBenchTest ? true : peer_online_raw;
+  /* 台架模式：云台板可能没通电/没连，peer 也要绕过，否则永远进不了 Working。 */
+  inputs_.peer_online = bench ? true : peer_online_raw;
   inputs_.estop = estop_switch;
 }
 
@@ -191,15 +207,19 @@ void Robot::GenerateCommands(float dt)
   const ChassisLimits& lim = chassis_->limits();
 
   /* ---------- 台架模式 ----------
-   * DBUS 解码还没修好（rc 恒 0），底盘进不了 Working，轮子完全动不了。
-   * 打开这个开关后：不看遥控、不看模式，直接用三个可在线写入的量驱动轮子，
-   * 便于验证「轮子转向 / 逆解 / 速度环」这些与遥控无关的部分。
-   * 默认全 0，上电不会动；用 J-Link 写 g_bench_* 即可让它转。 */
-  constexpr bool kBenchTest = false;
-  if (kBenchTest) {
+   * 不看遥控、不看模式，直接用三个可在线写入的量驱动轮子，便于验证
+   * 「逆解 / 速度环 / 电调」这些与遥控无关的部分。默认全 0，上电不会动。
+   *
+   * ⚠️ 这里必须把指令真正推进底盘模块：Chassis::Update() 只认 SetCommand()
+   *    存进去的 command_。曾经漏了这一句就直接 return，于是 wheel_vel 恒 0
+   *    → 速度环目标恒 0 → 四个轮子一动不动。这就是 2026-11-16 那次
+   *    「五个前提全强制为真、轮子仍不转」的真正原因（不是电调、不是接线）。 */
+  const bool bench = BenchOn();
+  if (bench) {
     command_.vx = g_bench_vx * lim.max_vx;
     command_.vy = g_bench_vy * lim.max_vy;
     command_.w = g_bench_w * lim.max_w;
+    chassis_->SetCommand(command_, delta_);
     return;
   }
 
@@ -266,6 +286,24 @@ void Robot::OutputWheels(float dt)
   }
 
   chassis_->Update(dt);
+
+  /* ---------- 开环占空比测试：绕过速度环，四轮直给同一个电流 ----------
+   * 目的：把「0x200 电流指令 → 电调 → 轮子转」这条链单独拎出来验证，
+   *      不和 PID、逆解、反馈混杂。判定树：
+   *        开环能转 → 问题在 PID/指令链（回去查 g_bench_vx 那条路径）
+   *        开环不转 → 看 g_can_tx_fail（发送层）→ 看电调小灯/24V（硬件层）
+   * 只在台架模式（g_bench_enable 魔数）且 duty 非 0 时生效；车必须架空。
+   * duty ∈ [-1,1] → 电流 raw ∈ [-16384, 16384]，正负号即转向。 */
+  if (BenchOn() && (g_bench_open_duty != 0.0f)) {
+    const float duty = Clamp(g_bench_open_duty, -1.0f, 1.0f);
+    const float raw = duty * 16384.0f;
+    for (uint8_t i = 0; i < kWheelCount; ++i) {
+      if (motors_[i] != nullptr) {
+        (void)motors_[i]->setInput(raw);
+      }
+    }
+    return;
+  }
 
   const float radius = chassis_->ik_solver().geometry().wheel_radius;
   const hello_world::chassis_ik_solver::WheelVel& wheel = chassis_->wheel_vel();

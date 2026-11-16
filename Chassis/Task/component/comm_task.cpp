@@ -23,6 +23,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "comm_task.hpp"
 
+#include <cstddef>
+
 #include "HW_can.hpp"
 #include "can.h"
 #include "chassis_ik_solver.hpp"
@@ -32,16 +34,13 @@
 #include "iwdg.h"
 #include "motor.hpp"
 #include "robot.hpp"   /* robot::Robot 完整定义（ins_all 只有前置声明） */
+#include "tick.hpp"
 #include "usart.h"
 
 namespace
 {
 /* DBUS 帧长 */
 constexpr uint16_t kDbusLen = 18u;
-/* 流缓冲：空闲中断一次收多少字节。DBUS 真实帧前面带 0x20 帧头（长度不是 18），
- * 按固定 18 字节接收会让窗口逐帧漂移，现象是「帧收到了但解析出的拨杆值乱跳」。
- * 所以改成收一大块，再在块内搜索合法帧，不依赖对齐。 */
-constexpr uint16_t kDbusStreamLen = 64u;
 
 /* ====== CAN 通道分配（由实机接线决定） ====== */
 CAN_HandleTypeDef* const kCanMotor = &hcan1;  ///< 电机（M3508 / 达妙）
@@ -75,6 +74,63 @@ volatile uint32_t g_dbus_ok[kDbusPorts] = {0u, 0u, 0u};
 volatile uint32_t g_dbus_err[kDbusPorts] = {0u, 0u, 0u};
 UART_HandleTypeDef* const kDbusUart[kDbusPorts] = {&huart3, &huart1, &huart6};
 
+/* ===== DBUS 原始流抓取（只采数据，不改解码逻辑）=====
+ *
+ * 背景：g_dbus_ev ≈ 72/秒、g_dbus_ok ≈ 0，说明串口确实在收、但帧内容判非法。
+ * 「帧长不是 18」「帧头是 0x20 0x00」「帧间隔多少 ms」这三个数必须用真数据定，
+ * 靠推测改解码已经浪费了一整天（而且回退过两次可能有用的改动）。
+ *
+ * 这里做的是【最小侵入的数据采集】，除了接收方式之外不改任何解码/校验：
+ *   - 只把 USART3 的接收换成 ReceiveToIdle（按总线空闲切块，不再假设帧长）
+ *   - 每切出一块记一条：到达时刻(ms) + 块长 + 前 64 字节
+ *   - 写进固定数组（128 条），用 J-Link savebin 导出，由 tools/dbus_capture.py 离线分析
+ *
+ * 判读靠 tools/dbus_capture.py，不靠"遥控有没有反应"（那是不等价的判据）。
+ *
+ * ⚠️ 采集开启期间 g_dbus_ev / g_dbus_ok 都是 0 —— 那条 18 字节定长路径根本没被使用，
+ *    别把它当成"串口没数据"。抓完把 kDbusCapture 改回 false 就完全恢复旧行为。
+ */
+constexpr bool kDbusCapture = true;
+constexpr uint8_t kDbusCapPort = 0u;      /* 0 = USART3（实测有信号的那一路） */
+constexpr uint16_t kCapBlockLen = 64u;    /* 单次切块上限，必须大于真实帧长 */
+constexpr uint32_t kCapEntries = 128u;    /* 记录条数（72 字节/条，约 9.2 KB RAM） */
+constexpr uint16_t kCapDataLen = 64u;
+constexpr uint32_t kCapMagic = 0xDB05CA90u;
+
+struct DbusCapEntry {
+  uint32_t tick;              /* 该块回调时刻，ms */
+  uint16_t len;               /* 该块字节数 */
+  uint8_t data[kCapDataLen];  /* 块的头部若干字节 */
+};
+
+/* 导出脚本依赖的内存布局（改字段顺序必须同步改 tools/dbus_capture.py）：
+ *   +0     magic      固定 0xDB05CA90
+ *   +4     n          已存条数（存满 128 后不再增加）
+ *   +8     n_total    总块数（一直增加 → 用它判断"现在还在收"）
+ *   +12    arm_fail   重新挂接收的失败次数，应恒为 0
+ *   +16    ent[128]   每条 72 字节：tick u32 / len u16 / data 64B / 补齐 2B
+ *   +9232  len_hist[65]  长度直方图（len 0..64）
+ *   结构体总长 9364 字节
+ */
+struct DbusCapBlock {
+  volatile uint32_t magic;
+  volatile uint32_t n;
+  volatile uint32_t n_total;
+  volatile uint32_t arm_fail;
+  DbusCapEntry ent[kCapEntries];
+  volatile uint16_t len_hist[kCapBlockLen + 1u];
+};
+
+DbusCapBlock g_dbus_cap = {};
+uint8_t g_dbus_cap_buf[kCapBlockLen] = {};
+
+/* 布局锚点：tools/dbus_capture.py 按这些偏移解析导出的 bin。
+ * 这里用 static_assert 钉死，改结构体忘了改脚本（或反过来）会当场编译失败。 */
+static_assert(sizeof(DbusCapEntry) == 72u, "DbusCapEntry 必须是 72 字节");
+static_assert(offsetof(DbusCapBlock, ent) == 16u, "g_dbus_cap.ent 必须从 +16 开始");
+static_assert(offsetof(DbusCapBlock, len_hist) == 9232u, "len_hist 必须在 +9232");
+static_assert(sizeof(DbusCapBlock) == 9364u, "g_dbus_cap 总长必须是 9364 字节");
+
 /** 由 UART 句柄反查端口索引（非法返回 kDbusPorts） */
 uint8_t DbusPortIndex(UART_HandleTypeDef* huart)
 {
@@ -86,13 +142,39 @@ uint8_t DbusPortIndex(UART_HandleTypeDef* huart)
   return kDbusPorts;
 }
 
-/** 把某一路 UART 配成 DBUS 电气参数并挂上 18 字节接收 */
+/** 把某一路 UART 配成 DBUS 电气参数并挂上接收 */
 void DbusArm(uint8_t idx)
 {
   if (idx >= kDbusPorts) {
     return;
   }
+  /* 抓取模式：只对指定口用 ReceiveToIdle，其余口保持原来的 18 字节定长接收 */
+  if (kDbusCapture && (idx == kDbusCapPort)) {
+    if (HAL_UARTEx_ReceiveToIdle_IT(kDbusUart[idx], g_dbus_cap_buf, kCapBlockLen) !=
+        HAL_OK) {
+      g_dbus_cap.arm_fail = g_dbus_cap.arm_fail + 1u;
+    }
+    return;
+  }
   (void)HAL_UART_Receive_IT(kDbusUart[idx], g_dbus_buf[idx], kDbusLen);
+}
+
+/** 记录一块原始数据（中断上下文：只做定长拷贝与计数，绝不解析） */
+void DbusCaptureRecord(uint16_t size)
+{
+  const uint16_t len = (size > kCapBlockLen) ? kCapBlockLen : size;
+  const uint32_t i = g_dbus_cap.n;
+  if (i < kCapEntries) {
+    DbusCapEntry* const e = &g_dbus_cap.ent[i];
+    e->tick = hello_world::tick::GetTickMs();
+    e->len = len;
+    for (uint16_t k = 0u; k < len; ++k) {
+      e->data[k] = g_dbus_cap_buf[k];
+    }
+    g_dbus_cap.n = i + 1u;
+  }
+  g_dbus_cap.n_total = g_dbus_cap.n_total + 1u;
+  g_dbus_cap.len_hist[len] = g_dbus_cap.len_hist[len] + 1u;
 }
 
 /** 重新配置并挂接收（初始化时用） */
@@ -171,6 +253,8 @@ void CommTaskInit(void)
   /* ---------- DBUS：三路都按 DBUS 参数接收（见上面的探测说明） ----------
    * 用中断接收而不是 DMA：USART1 没有配 RX DMA，三路统一走 IT 更简单，
    * 且 100 kbaud 下每字节一次中断（约 10 kHz）对 168 MHz 的负载可以接受。 */
+  /* 抓取缓冲的自检字：导出脚本先读这个字，确认符号地址没找错 */
+  g_dbus_cap.magic = kCapMagic;
   for (uint8_t i = 0; i < kDbusPorts; ++i) {
     DbusConfigurePort(i);
   }
@@ -234,6 +318,24 @@ extern "C" void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart)
   DbusHandleFrame(idx, kDbusLen);
   /* 必须重新挂上，否则只能收到一帧 */
   DbusArm(idx);
+}
+
+/**
+ * @brief       ReceiveToIdle 回调：一块数据（一个空闲间隔）收完
+ * @note        只有被切成 ReceiveToIdle 的那一路（kDbusCapPort）会进这里，用来抓原始流。
+ *              这里【不做】任何解码 —— 目的只是把字节原样存进 g_dbus_cap。
+ */
+extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t Size)
+{
+  const uint8_t idx = DbusPortIndex(huart);
+  if (idx >= kDbusPorts) {
+    return;
+  }
+  if (!(kDbusCapture && (idx == kDbusCapPort))) {
+    return;
+  }
+  DbusCaptureRecord(Size);
+  DbusArm(idx);   /* 必须重新挂上，否则只收到一块 */
 }
 
 extern "C" void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart)

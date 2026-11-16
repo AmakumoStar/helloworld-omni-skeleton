@@ -64,6 +64,8 @@
 | 位置 | 现在是 | 确认后应改为 |
 |---|---|---|
 | `Chassis/Task/component/comm_task.cpp` | 0x200+0x1FF × CAN1+CAN2（4 帧/ms） | 只留确定的那一组 |
+| `Chassis/Task/component/comm_task.cpp` | `kDbusCapture = true`（DBUS 原始流抓取） | 抓完改回 false，否则 `g_dbus_ev/g_dbus_ok` 恒 0 |
+| `Chassis/RobotModules/component/robot.cpp` | `g_bench_enable` 运行期开关（写魔数 0x5A5A5A5A 才生效，上电默认关） | 保持"上电默认关"即可，不要改成编译期 true |
 | `Gimbal/RobotModules/component/robot.cpp` | `kBenchTest = false` | 保持 false（自测开关） |
 | `Gimbal/inc/pid_tune.hpp` | 三个 `volatile float` 在线调参 | 定稿后写回 `MakeYawConfig()` 并注明 |
 | 三处调试限幅 | 0.6 / 1.0 / 1.0 | 恢复正式值（B6~B8） |

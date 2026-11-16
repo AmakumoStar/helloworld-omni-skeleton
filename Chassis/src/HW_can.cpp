@@ -44,6 +44,15 @@ volatile uint32_t g_rx_ids[2][8] = {{0u}, {0u}};
 volatile uint32_t g_rx_cnt[2][8] = {{0u}, {0u}};
 volatile uint32_t g_rx_uniq[2] = {0u, 0u};
 
+/* ===== 调试用：发送计数 =====
+ * 为什么必须加：CAN_Send_Msg 原来把 HAL_CAN_AddTxMessage 的返回值丢掉了。
+ * 三个发送邮箱都满（或总线错误被动）时，发送会静默失败 —— 现象和「电调没收到指令」
+ * 一模一样，而且从任何别的变量上都看不出来。
+ *   g_can_tx_ok[0/1]   CAN1/CAN2 成功进入邮箱的帧数
+ *   g_can_tx_fail[0/1] 失败帧数（正常应恒为 0；非 0 说明发送链路有问题） */
+volatile uint32_t g_can_tx_ok[2] = {0u, 0u};
+volatile uint32_t g_can_tx_fail[2] = {0u, 0u};
+
 /** 记录一帧的 ID（中断上下文，只做计数；C++20 起 volatile 不应用 ++） */
 static void RecordRxId(uint8_t bus, uint32_t std_id)
 {
@@ -138,7 +147,13 @@ void CAN_Send_Msg(CAN_HandleTypeDef* hcan, uint8_t* msg, uint32_t id, uint8_t le
   tx_header.IDE = CAN_ID_STD;
   tx_header.RTR = CAN_RTR_DATA;
   tx_header.DLC = len;
-  (void)HAL_CAN_AddTxMessage(hcan, &tx_header, msg, &p_tx_mailbox);
+  const uint8_t bus = (hcan == &hcan2) ? 1u : 0u;
+  if (HAL_CAN_AddTxMessage(hcan, &tx_header, msg, &p_tx_mailbox) == HAL_OK) {
+    g_can_tx_ok[bus] = g_can_tx_ok[bus] + 1u;
+  } else {
+    /* 邮箱全满 / 总线错误：以前这里什么都不记，故障完全隐形 */
+    g_can_tx_fail[bus] = g_can_tx_fail[bus] + 1u;
+  }
 }
 
 /**
