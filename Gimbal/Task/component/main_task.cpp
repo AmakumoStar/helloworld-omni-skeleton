@@ -75,13 +75,13 @@ hello_world::pid::Pid::Config MakeYawConfig()
   return cfg;
 }
 
-/** pitch 位置环参数（整定起点） */
+/** pitch 位置环参数（初值 = 运行期可调值，见文件末尾的 g_pitch_*） */
 hello_world::pid::Pid::Config MakePitchConfig()
 {
   hello_world::pid::Pid::Config cfg;
-  cfg.kp = 5.0f;
-  cfg.ki = 0.0f;
-  cfg.kd = 0.12f;
+  cfg.kp = hello_world::tune::g_pitch_kp;
+  cfg.ki = 0.0f;   /* 防飞转红线：必须 0 */
+  cfg.kd = hello_world::tune::g_pitch_kd;
   cfg.out_min = -2.0f;
   cfg.out_max = 2.0f;
   cfg.int_min = -1.0f;
@@ -154,3 +154,8 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
 volatile float hello_world::tune::g_yaw_kp = 1.5f;
 volatile float hello_world::tune::g_yaw_ki = 0.0f;
 volatile float hello_world::tune::g_yaw_kd = 0.10f;
+
+/* pitch 位置环：实车"手拨不够硬"，2026-11-17 由 5.0/0.12 提到 10.0/0.25。
+ * ki 仍然为 0（防飞转红线，别加）。 */
+volatile float hello_world::tune::g_pitch_kp = 10.0f;
+volatile float hello_world::tune::g_pitch_kd = 0.25f;

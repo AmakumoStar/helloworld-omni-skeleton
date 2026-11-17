@@ -28,7 +28,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('uid', 'alive', 'dump-dbus', 'dump-trace', 'flash', 'bench')]
+    [ValidateSet('uid', 'alive', 'dump-dbus', 'dump-trace', 'flash', 'bench', 'zero-check', 'wdg-demo')]
     [string]$Action = 'uid',
 
     [ValidateSet('chassis', 'gimbal')]
@@ -407,6 +407,130 @@ function Do-Bench() {
     Write-Host '下一步     : 看四个轮子是否同向慢转；测完用 -Action bench -BenchOff 收工'
 }
 
+# ---------------------------------------------------------------- zero-check
+# 「急停归零 / 离线归零」的软件判据：读四个轮电机的 raw_input_ 与 vel_。
+#   raw_input_（对象 +0x58）= 真正要发给电调的值，0 = 电机不输出（这是验收项）
+#   vel_（对象 +0x08）      = 反馈转速，0 = 确实没在转
+# 只读一个不够：反馈线拔了 vel_ 也恒 0，必须两者一起看。
+# 同时读 uwTick：它在涨 = 板子没死、是软件主动归零，不是掉电。
+function Do-ZeroCheck() {
+    $addrWheels = Get-SymbolAddress 'GetMotorWheel(int)::wheels'
+    $addrTick   = Get-SymbolAddress 'uwTick'
+    $addrEstop  = Get-SymbolAddress 'robot::g_estop_force'
+    $addrForce  = Get-SymbolAddress 'robot::g_force_mode'
+
+    $base = [Convert]::ToUInt32($addrWheels.Substring(2), 16)
+    $addrRaw = @()
+    $addrVel = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $addrRaw += ('0x{0:X8}' -f ($base + 0x68 * $i + 0x58))
+        $addrVel += ('0x{0:X8}' -f ($base + 0x68 * $i + 0x08))
+    }
+
+    $lines = @('si SWD', 'connect', $FreezeIwdg)
+    foreach ($a in $addrRaw) { $lines += "mem32 $a 1" }
+    foreach ($a in $addrVel) { $lines += "mem32 $a 1" }
+    $lines += "mem32 $addrTick 1"
+    $lines += "mem32 $addrEstop 1"
+    $lines += "mem32 $addrForce 1"
+    $lines += "mem32 $addrDbOk 3"
+    $lines += @('g', 'q')
+    $out = Invoke-JLink $lines 'zero'
+
+    function ReadW([string]$addr) {
+        $line = Get-WordLine $out $addr.Substring(2).ToUpper()
+        if (-not $line) { return $null }
+        return [Convert]::ToUInt32((($line -split '=')[1].Trim() -split '\s+')[0], 16)
+    }
+    function ReadF([string]$addr) {
+        $w = ReadW $addr
+        if ($null -eq $w) { return [double]::NaN }
+        return [BitConverter]::ToSingle([BitConverter]::GetBytes([uint32]$w), 0)
+    }
+
+    Write-Host '=== 归零检查（四轮电机对象）==='
+    Write-Host ('  {0,-4} {1,12} {2,12}' -f '轮', 'raw_input_', 'vel_')
+    $allZero = $true
+    $names = @('LF', 'LB', 'RB', 'RF')
+    for ($i = 0; $i -lt 4; $i++) {
+        $r = ReadW $addrRaw[$i]
+        $vRaw = ReadW $addrVel[$i]
+        if ($null -eq $r -or $null -eq $vRaw) { Write-Host $out; throw '读电机对象失败' }
+        $v = [BitConverter]::ToSingle([BitConverter]::GetBytes([uint32]$vRaw), 0)
+        if ([math]::Abs([double]$r) -gt 0.5) { $allZero = $false }
+        Write-Host ('  {0,-4} {1,12} {2,12:F2}' -f $names[$i], $r, $v)
+    }
+    $tick = ReadW $addrTick
+    $estop = ReadW $addrEstop
+    $force = ReadW $addrForce
+    Write-Host ''
+    Write-Host ('uwTick       : {0} ms（在涨说明板子活着，是软件归零）' -f $tick)
+    Write-Host ('g_estop_force: {0}' -f $estop)
+    Write-Host ('g_force_mode : {0}' -f $force)
+    Write-Host ''
+    if ($allZero) {
+        Write-Host '判读：四轮 raw_input_ 全为 0 —— 归零成立（电机确实没收到输出）'
+    } else {
+        Write-Host '判读：✗ 有轮子 raw_input_ 非 0，归零没成立（看是不是还停在 Working）'
+    }
+}
+
+# ---------------------------------------------------------------- wdg-demo
+# 看门狗复位演示（底盘超时 300 ms / 云台 600 ms，见 Core/Src/iwdg.c 的 prescaler×reload/32 kHz）。
+# 原理：IWDG 由 LSI 独立驱动，CPU 被 J-Link halt 住时**照样计数**，除非
+# DBGMCU_APB1_FZ 的 DBG_IWDG_STOP(bit12) = 1。所以演示要先把这一位清 0，
+# 再故意 halt 超过超时时间，板子就会自己复位。
+#
+# ⚠️ 复位会清掉所有 RAM 调试变量（g_estop_force / g_force_mode / g_ignore_delta 回默认），
+#    所以演示前必须让车处于**物理安全状态**：四轮架空，或左摇杆拉到底（急停）。
+#
+# 判据：RCC_CSR(0x40023874) bit29 (IWDGRSTF) = 1，且复位后能自动恢复（重新进 Working）。
+function Do-WdgDemo() {
+    $csr = '0x40023874'
+    $dbg = '0xE0042008'
+    $tickAddr = Get-SymbolAddress 'uwTick'
+
+    Write-Host '=== 看门狗复位演示（底盘 300 ms）==='
+    Write-Host '步骤 0：清 DBG_IWDG_STOP（否则 halt 时狗也停），并清复位标志'
+    $out = Invoke-JLink @(
+        'si SWD', 'connect',
+        ('w4 {0} 00000000' -f $dbg),
+        ('w4 {0} 01000000' -f $csr),   # RMVF=1，清掉历史复位标志
+        ('mem32 {0} 1' -f $csr),
+        ('mem32 {0} 1' -f $dbg),
+        'g', 'q'
+    ) 'wdgprep'
+    ($out -split "`r?`n") | Where-Object { $_ -match '^[0-9A-F]{8} =' } | ForEach-Object { Write-Host ('  ' + $_) }
+    Write-Host '  判读：CSR 现在应为 00000000（没有历史复位标志）'
+
+    Write-Host '步骤 1：halt 住 CPU 1.5 s（超过 300 ms 超时），让 IWDG 咬'
+    $null = Invoke-JLink @('si SWD', 'connect', 'sleep 1500', 'q') 'wdgbite'
+    Start-Sleep -Milliseconds 400
+
+    Write-Host '步骤 2：读复位后的 RCC_CSR 与 uwTick'
+    $out2 = Invoke-JLink @(
+        'si SWD', 'connect', $FreezeIwdg,
+        ('mem32 {0} 1' -f $csr),
+        ('mem32 {0} 1' -f $tickAddr),
+        'g', 'q'
+    ) 'wdgafter'
+    $csrLine = Get-WordLine $out2 '40023874'
+    $tickLine = Get-WordLine $out2 (($tickAddr.Substring(2)).ToUpper())
+    if (-not $csrLine) { Write-Host $out2; throw '读 RCC_CSR 失败' }
+    $csrVal = [Convert]::ToUInt32((($csrLine -split '=')[1].Trim()), 16)
+    Write-Host ('  RCC_CSR = 0x{0:X8}' -f $csrVal)
+    $bits = @{ 29 = 'IWDG 复位'; 28 = '软件复位'; 27 = '上电复位'; 26 = '引脚复位'; 25 = 'BOR 复位' }
+    $hit = @()
+    foreach ($b in 25..29) { if (($csrVal -band [uint32](1 -shl $b)) -ne 0) { $hit += $bits[$b] } }
+    if ($hit.Count -gt 0) { Write-Host ('  置位：' + ($hit -join '、')) } else { Write-Host '  置位：无' }
+    if (($csrVal -band 0x20000000) -ne 0) {
+        Write-Host '判读：✓ IWDG 复位成立（bit29 = 1）'
+        Write-Host '      接着看车有没有自动恢复：摇杆回中 → 应重新进 Working，轮子不动、云台重新指稳'
+    } else {
+        Write-Host '判读：✗ bit29 没置位 —— 检查 DBG_IWDG_STOP 是否真的清成 0（步骤 0 的回读）'
+    }
+}
+
 # ---------------------------------------------------------------- main
 switch ($Action) {
     'uid'       { $null = Do-Uid }
@@ -415,4 +539,6 @@ switch ($Action) {
     'dump-trace' { Do-DumpTrace }
     'flash'     { Do-Flash }
     'bench'     { Do-Bench }
+    'zero-check' { Do-ZeroCheck }
+    'wdg-demo'  { Do-WdgDemo }
 }

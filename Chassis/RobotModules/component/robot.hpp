@@ -139,12 +139,9 @@ class Robot
   /* 状态 */
   LifeState life_state_ = LifeState::kDead;
   ChassisMode mode_ = ChassisMode::kSeparate;
-  /* 模式选择器档位（带迟滞的边沿触发）：+1 = 分离，0 = 跟随，-1 = 小陀螺。
-   * mode_sel_trig_：一次拨动只允许切一档，回中后才解锁。
-   * 见 robot.cpp 里 UpdateInputs() 的实现说明。
-   * 上电默认 +1（分离）：w 只由右摇杆给，最不容易"自己动"。 */
-  int8_t mode_sel_ = 1;
-  bool mode_sel_trig_ = false;
+  /* 上电互锁（2026-11-17）：三挡拨杆必须先在"分离"档出现一次，之后才按拨杆选模式。
+   * 防止上电时拨杆停在小陀螺档、一武装就自旋。复位后自动清零（RAM）。 */
+  bool mode_sw_latched_ = false;
   LifeInputs inputs_{};
   ChassisVel command_{};   ///< 本周期云台系指令
   float delta_ = 0.0f;     ///< 云台相对车头的偏航角
@@ -153,6 +150,14 @@ class Robot
   /* 上电武装计时（ms）：三轴摇杆回中并保持 kArmHoldMs 后才允许输出。
    * 目的：防止「带着摇杆上电」时底盘立刻窜车——实机踩过这个坑。 */
   float arm_ms_ = 0.0f;
+
+  /* 分离模式航向保持（2026-11-17）：目标 = 进分离那一刻的车头绝对朝向。
+   * sep_hold_valid_ = false 时，GenerateCommands 会先取一次当前朝向当目标；
+   * 进分离模式、或从 Dead 回到 Working 时置 false。 */
+  float sep_yaw_target_ = 0.0f;
+  bool sep_hold_valid_ = false;
+  /* 上一拍的模式，用来检测"刚进分离"这个沿 */
+  ChassisMode last_mode_ = ChassisMode::kSeparate;
 
   /* 跟随模式 PID（w 由「云台朝向 − 车头朝向」闭环给出） */
   hello_world::pid::Pid follow_pid_{};

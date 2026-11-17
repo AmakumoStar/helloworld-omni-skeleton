@@ -180,14 +180,22 @@ void Robot::GenerateCommands(float dt)
     return;
   }
 
-  /* 调参期：每周期把「可调增益」写进 yaw 位置环（set_config 不清积分状态），
+  /* 调参期：每周期把「可调增益」写进两个位置环（set_config 不清积分状态），
    * 这样用 J-Link 直接改内存就能实时调参，不必反复编译烧录。 */
   {
     hello_world::pid::Pid::Config cfg = gimbal_->yaw_pid().config();
     cfg.kp = hello_world::tune::g_yaw_kp;
-    cfg.ki = hello_world::tune::g_yaw_ki;
+    cfg.ki = hello_world::tune::g_yaw_ki;   /* 红线：必须 0 */
     cfg.kd = hello_world::tune::g_yaw_kd;
     gimbal_->yaw_pid().set_config(cfg);
+  }
+  {
+    /* pitch：ki 永远不写（保持 0）。只更新 kp/kd，方便在线调"硬度"。 */
+    hello_world::pid::Pid::Config cfg = gimbal_->pitch_pid().config();
+    cfg.kp = hello_world::tune::g_pitch_kp;
+    cfg.kd = hello_world::tune::g_pitch_kd;
+    cfg.ki = 0.0f;
+    gimbal_->pitch_pid().set_config(cfg);
   }
 
   const GimbalLimits& lim = gimbal_->limits();

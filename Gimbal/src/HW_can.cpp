@@ -106,7 +106,14 @@ static void RouteRxFrame(uint8_t bus, uint32_t std_id, const uint8_t* data)
 
 void CanFilter_Init(CAN_HandleTypeDef* hcan)
 {
-  CAN_FilterTypeDef can_filter;
+  /* ⚠️ 必须零初始化：曾经写成 `CAN_FilterTypeDef can_filter;`（未初始化），
+   * 而下面只填了 7 个字段，`SlaveStartFilterBank` 是**栈上的垃圾值**。
+   * 这个字段 = CAN2 的起始滤波器 bank（HAL 会写进 FMR.CAN2SB）；
+   * 垃圾值一旦是 0，CAN2 就会去用 **bank 0** —— 那是给 CAN1 配的、指向 FIFO0 的
+   * "全收"滤波器。结果：CAN2 的帧全部进 FIFO0，而云台只开了 CAN2_RX1 中断
+   * → 中断永不触发 → FIFO 满/溢出（2026-11-17 实测 RF0R=0x1B: FMP=3 + FULL + OVR）
+   * → pitch 的 0x011 永远读不到，之前被误判成"CAN2 物理静默、要查线束"。 */
+  CAN_FilterTypeDef can_filter = {0};
 
   /* 全收：掩码全 0，任何 ID 均通过 */
   can_filter.FilterMode = CAN_FILTERMODE_IDMASK;
@@ -126,6 +133,9 @@ void CanFilter_Init(CAN_HandleTypeDef* hcan)
   } else {
     return;
   }
+  /* CAN2 从 bank 14 开始（bank 0~13 归 CAN1）。两路都写成 14 也没问题：
+   * 它写的是同一个 FMR.CAN2SB，与"这次配的是哪一路"无关。 */
+  can_filter.SlaveStartFilterBank = 14;
 
   if (HAL_CAN_ConfigFilter(hcan, &can_filter) != HAL_OK) {
     Error_Handler();

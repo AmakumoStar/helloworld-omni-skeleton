@@ -114,7 +114,12 @@ static void RouteRxFrame(uint8_t bus, uint32_t std_id, const uint8_t* data)
 
 void CanFilter_Init(CAN_HandleTypeDef* hcan)
 {
-  CAN_FilterTypeDef can_filter;
+  /* ⚠️ 必须零初始化（2026-11-17 云台板踩过）：原来写成 `CAN_FilterTypeDef can_filter;`，
+   * 只填了 7 个字段，`SlaveStartFilterBank` 是**栈上的垃圾值**。
+   * 它是 CAN2 的起始滤波器 bank（HAL 写进 FMR.CAN2SB）；垃圾值一旦偏了，CAN2 就会
+   * 去用 CAN1 的 bank（指向 FIFO0），或者干脆没有可用 bank。
+   * 本板碰巧因为 RX0/RX1 两个中断都开着才一直没事 —— 但这是运气，不是设计。 */
+  CAN_FilterTypeDef can_filter = {0};
 
   /* 全收：掩码全 0，任何 ID 均通过 */
   can_filter.FilterMode = CAN_FILTERMODE_IDMASK;
@@ -134,6 +139,8 @@ void CanFilter_Init(CAN_HandleTypeDef* hcan)
   } else {
     return;
   }
+  /* CAN2 从 bank 14 开始（bank 0~13 归 CAN1）；两路都写 14 也只影响同一个 FMR.CAN2SB */
+  can_filter.SlaveStartFilterBank = 14;
 
   if (HAL_CAN_ConfigFilter(hcan, &can_filter) != HAL_OK) {
     Error_Handler();

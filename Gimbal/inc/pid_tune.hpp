@@ -17,6 +17,13 @@ extern volatile float g_yaw_kp;  ///< yaw 位置环比例
 extern volatile float g_yaw_ki;  ///< yaw 位置环积分
 extern volatile float g_yaw_kd;  ///< yaw 位置环微分（对误差微分）
 
+/* pitch 位置环（2026-11-17 加）：实车"手拨不够硬"——原来 kp=5，
+ * 力矩 1 N·m 上限下误差 11.5° 就饱和，推一点点就让位。
+ * 现在默认 kp=10（3° 误差就有 0.52 N·m）、kd=0.25 压住回弹。
+ * 注意 ki 仍然必须为 0（防飞转红线），重力静差靠 kp 压，不靠积分。 */
+extern volatile float g_pitch_kp;  ///< pitch 位置环比例
+extern volatile float g_pitch_kd;  ///< pitch 位置环微分（对误差微分）
+
 }  // namespace tune
 }  // namespace hello_world
 

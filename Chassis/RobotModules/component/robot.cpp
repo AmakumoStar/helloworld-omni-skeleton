@@ -84,6 +84,52 @@ volatile uint32_t g_estop_force = 0u;
  * ⚠️ 正式使用必须为 0。 */
 volatile uint32_t g_ignore_delta = 0u;
 
+/* ================= 车头方向偏移（机械改了 90°）=================
+ * 2026-11-17 实车：车头方向**机械上**换到了原方向的左转 90°。
+ * 四个轮子的物理位置/接线没动，所以逆解器（chassis_ik_solver 的四个轮子角色）还是
+ * **旧车体系**；只要在"解算用的坐标系角度"上统一加 90°，逆解结果就是新车体系。
+ *
+ * 为什么不是在逆解里改轮子表：轮子的角色是机械定义的（LF/LB/RB/RF 对应哪个电机），
+ * 改轮子表等于重排电机 ID + 方向，风险大得多；这里只是把指令所在坐标系转 90°，
+ * 一行动量、随时能改回。
+ *
+ * 数学：v_旧 = R(+90°)·v_新。而 GimbalToChassis(v, δ) 等价于 R(δ)·v，
+ *       所以把传给它的 δ 换成 (δ + 90°) 就同时完成了"坐标系转换"。
+ *
+ * ⚠️ 车头换了以后，**云台关节角的零点（g_delta_offset）必须重新标定**，
+ *    否则 δ 偏 90°，小陀螺的"平移随枪口"会歪 90°。
+ *    标定方法见 g_dbg_joint 的注释（把枪口对到新车头，读 g_dbg_joint）。 */
+/* 运行期可写（J-Link 直接改 float 位模式）：这是调"前推朝哪走"最快的旋钮，
+ * 不用重编译。世界方向 = R(θ车 + δ + 这个值)。
+ *
+ * 2026-11-17 实测定稿：**0**。
+ * 走过的弯路（别再重推）：
+ *   · +90° 时三个模式都偏左 90°；−90° 时偏右 180° —— 说明"机械改的那 90°"
+ *     **不是**枪口相对车体逆解坐标系的偏角，而是"车头长什么样"的定义。
+ *   · 取 0 之后：分离/跟随/小陀螺 前推全部正对枪口（实测通过）。
+ * 结论：**前推方向恒等于枪口方向**，与车体外形无关；那 90° 只影响"车头"的叫法。
+ * （若以后要改成"前推按车体外形走"，把这里写成 ±90° 并重新验三个模式。） */
+volatile float g_front_yaw = 0.0f;
+
+/* ================= 分离模式航向保持 =================
+ * 需求（2026-11-17）：分离模式下手不能拨动车头 —— 外力把车拧歪，它自己转回来。
+ * 做法：进分离模式那一刻把底盘 IMU 的绝对朝向记为 0°，之后
+ *       w = kp·(目标 − 当前)，限幅 ±kSepHoldMaxW，再走常规轮速环。
+ * 为什么用 IMU 而不是轮速：外力推车时轮子在滑，轮速环根本不知道车转了。
+ * 注意：IMU 无磁力计，长时会有度/分钟级漂移，保持的是"相对上电后的朝向"。
+ * g_sep_hold_enable 可在线写 0 关掉（调试转向时用）。 */
+constexpr float kSepHoldMaxW = 0.60f;  /* 航向保持最大角速度，rad/s（比 max_w 小，避免甩） */
+volatile float g_sep_hold_kp = 1.2f;   /* rad/s per rad，运行期可调 */
+/* 阻尼项（2026-11-17 加）：只有 P 时，停下后底盘会左右摆几下才停 —— 误差一出现就
+ * 全力转回去、冲过头再反向。加 −kd·ω（ω 取底盘 IMU yaw 角速度）后是一次收敛。
+ * 调法：摆得多就加大 kd；回正变慢（发黏）就减小 kd。 */
+volatile float g_sep_hold_kd = 0.15f;  /* rad/s per rad/s，运行期可调（实测 0.35 有高频抖，0.15 干脆） */
+volatile uint32_t g_sep_hold_enable = 1u;
+
+/* δ 零点重标定用的调试镜像（见 UpdateInputs） */
+volatile float g_dbg_joint = 0.0f;  /* 云台关节角原始值（多圈，未扣零点），rad */
+volatile float g_dbg_delta = 0.0f;  /* 扣零点并归一化后的 δ，rad */
+
 /* g_frame_lead：小陀螺模式的**坐标系超前补偿系数**，单位 s（rad per rad/s）。
  * 为什么需要：平移指令按下发那一拍的 δ 解算，但车轮/整车真正把速度做出来要 ~0.2 s；
  * 这 0.2 s 里底盘又自转 ω·τ，于是**车实际走的直线方向 = R(ω·τ) × 枪口方向**。
@@ -101,7 +147,11 @@ volatile float g_frame_lead = 0.19f;
  * 于是在分离模式（底盘不转）下重新精确标定：offset 再加 0.823 → **3.4842**。
  * 换车/换电机/重新装过后必须重新标定这个值。
  * 标定方法：云台正对车头，读 delta_（g_delta_offset=0 时即原始关节角），写回此处。 */
-volatile float g_delta_offset = 3.4842f;
+/* 2026-11-17 机械改 90° 后重新标定：**1.8900**（旧值 3.4842 作废）。
+ * 标定方法（和以前一样）：把枪口对到**新车头**方向，读 g_dbg_joint，把它写进这里。
+ * 当次读数来自操作手用长基线对准后的关节角，δ 残差 −0.06°，足够。
+ * ⚠️ 这个值和 g_front_yaw 是**一对**：两者一起决定"推前进朝哪走"，改一个必须重验另一个。 */
+volatile float g_delta_offset = 1.8900f;
 
 /* ===== 跟随环在线整定（J-Link 直接写）=====
  * 2026-11-17 实测：δ=-0.211 rad 时切到跟随模式，车**左右反复摆了几下**才停。
@@ -297,11 +347,11 @@ void Robot::Update(float dt)
     if (rc_ != nullptr) {
       /* 同样先过死区，避免中位抖动被转成云台的持续漂移 */
       d.yaw_des = -ApplyStickDeadzone(rc_->rc_rh());   /* 右摇杆横向 → yaw 角速度（归一化） */
-      /* 右摇杆竖直超出 ±0.5 时它是"模式选择器"，此时不再当 cloud台 pitch 用，
-       * 否则选模式的同时云台会跟着点头。只有中间那段才透传 pitch。 */
-      d.pitch_des = (fabsf(rc_->rc_rv()) <= 0.5f)
-                        ? ApplyStickDeadzone(rc_->rc_rv())
-                        : 0.0f;
+      /* 2026-11-17：模式已挪到**右上三挡拨杆**，右摇杆竖直整个让给 pitch。
+       * 不再有 |rv| ≤ 0.5 的门限 —— 那是"选择器"时代的限制，会导致 pitch 打不到
+       * 行程两端。现在右摇杆竖直全程透传，云台侧按 max_pitch_rate 积分目标，
+       * 位置环负责"停住"（松手即停在当前位置）。 */
+      d.pitch_des = ApplyStickDeadzone(rc_->rc_rv());
     } else {
       d.yaw_des = 0.0f;
       d.pitch_des = 0.0f;
@@ -366,52 +416,42 @@ void Robot::UpdateInputs(void)
     rc_online = true;
     estop_switch = false;
   } else if (rc_ != nullptr) {
-    /* 急停判定（2026-11-17 按实车遥控器改写）：
-     * 这台遥控器**没有独立的三档拨杆**，只有两个摇杆，"急停"是左摇杆拉到底并卡住。
-     * 实测拨杆字节恒为 0x0303（byte5 高 4 位恒 0xF），所以原来的
-     * `rc_l_switch() == kSwitchStateDown` 永远不成立 —— 急停从来没生效过。
-     * 现在两者都判：拨杆判断保留（以后换回 DJI 遥控器仍可用），
-     * 再加上"左摇杆 ≤ -0.9"（卡住位置是 -1.0，正常后退最多 -0.7，不会误触）。 */
+    /* 急停判定：两条**或**关系，任何一条成立都全零。
+     *   1) 左摇杆拉到底（≤ -0.9；卡住位置是 -1.0，正常后退最多 -0.7，不会误触）
+     *      —— 需求里"急停保留左摇杆到底"就是这一条，不动。
+     *   2) 左拨杆拨到最下（kSwitchStateDown）
+     *      —— 2026-11-17 实测拨杆已进帧（data[5] 会变），这条现在真的生效了。
+     *      保留它作为第二条急停通路，fail-safe；不想要就把这半句删掉。
+     * ⚠️ 两个"左"是不同物件：左**摇杆**（中间那个）和左**拨杆**（左上小拨杆）。 */
     estop_switch = (rc_->rc_l_switch() ==
                     hello_world::remote_control::kSwitchStateDown) ||
                    (rc_->rc_lv() <= -0.9f);
-    /* ---------- 模式选择（2026-11-17 按实车改写：边沿触发 + 迟滞）----------
-     * 这台手柄只有两个摇杆、没有三档拨杆，所以用**右摇杆竖直**当选择器。
-     * 为什么不能用"位置映射"：摇杆是弹簧回中的，按住才能选的话一松手就掉回中位，
-     * 开车时不可能一直按住。所以改成**拨一下切一档**：
-     *     往上一拨（rv > +0.75）→ 下一档：分离 → 跟随 → 小陀螺 → 分离 …
-     *     往下一拨（rv < -0.75）→ 上一档（反方向循环）
-     *     回到 |rv| < 0.45 才重新允许触发（迟滞 + 边沿，一次拨动只切一档）
-     * 中间那段（|rv| ≤ 0.5）仍可作为云台 pitch 摇杆使用，见 Update() 里的转发。
+    /* ---------- 模式选择：**右上三挡拨杆**（2026-11-17 实测拨杆已进帧）----------
+     * 映射（与 DT7 定义一致，实测 data[5]）：上=1 → 分离，中=3 → 跟随，下=2 → 小陀螺。
+     * 为什么从"右摇杆拨一下切一档"改成拨杆：右摇杆竖直要整个让给云台 pitch，
+     * 一根轴不能同时当模式选择器（之前 |rv|>0.5 时不许 pitch，pitch 就没法用）。
+     *
+     * ⚠️ 上电互锁：复位后必须**先在"分离"档出现一次**，之后才按拨杆选模式。
+     *    否则上电时拨杆若停在小陀螺档，一武装就直接自旋（这车 1.0 rad/s 的自旋
+     *    已经在验收里了，不能靠人记得先回位）。复位后 latch 自动清零。
+     *
      * 调试时 g_force_mode 优先（1/2/3 → Separate/Follow/Spin）。 */
     if ((g_force_mode >= 1u) && (g_force_mode <= 3u)) {
       mode_ = static_cast<ChassisMode>(static_cast<uint8_t>(g_force_mode - 1u));
     } else {
-      const float rv = rc_->rc_rv();
-      if (fabsf(rv) > 0.75f) {
-        if (!mode_sel_trig_) {
-          mode_sel_trig_ = true;
-          int8_t m = mode_sel_ + ((rv > 0.0f) ? -1 : +1);   /* 上拨 → 下一档 */
-          if (m > 1) {
-            m = -1;
-          } else if (m < -1) {
-            m = 1;
-          }
-          mode_sel_ = m;
+      const hello_world::remote_control::SwitchState sw = rc_->rc_r_switch();
+      if (!mode_sw_latched_) {
+        /* 互锁未解除：强制分离，直到看到一次"分离"档 */
+        mode_ = ChassisMode::kSeparate;
+        if (sw == hello_world::remote_control::kSwitchStateUp) {
+          mode_sw_latched_ = true;
         }
-      } else if (fabsf(rv) < 0.45f) {
-        mode_sel_trig_ = false;   /* 回中才解锁，防止一次拨动连切好几档 */
-      }
-      switch (mode_sel_) {
-        case 1:
-          mode_ = ChassisMode::kSeparate;
-          break;
-        case -1:
-          mode_ = ChassisMode::kSpin;
-          break;
-        default:
-          mode_ = ChassisMode::kFollow;
-          break;
+      } else if (sw == hello_world::remote_control::kSwitchStateDown) {
+        mode_ = ChassisMode::kSpin;
+      } else if (sw == hello_world::remote_control::kSwitchStateMid) {
+        mode_ = ChassisMode::kFollow;
+      } else {
+        mode_ = ChassisMode::kSeparate;
       }
     }
   }
@@ -431,12 +471,28 @@ void Robot::UpdateInputs(void)
 
   /* ---- 双板通讯 ---- */
   const bool peer_online_raw = (comm_ != nullptr) && (!comm_->isOffline());
-  delta_ = peer_online_raw ? comm_->gimbal_data().yaw : 0.0f;
+  const float joint_raw = peer_online_raw ? comm_->gimbal_data().yaw : 0.0f;
+  delta_ = joint_raw;
   /* 关节角零点标定：云台正对车头时把当时读到的值写进 g_delta_offset，
    * 之后 δ≈0 就代表"枪口正对车头"。见 g_delta_offset 的注释。
    * ⚠️ 这里保留**真实 δ**（跟随模式要用它算 w）；
    *    只有"平移坐标系"会因为 g_ignore_delta=1 而用 0，见 GenerateCommands。 */
   delta_ = WrapToPi(delta_ - g_delta_offset);
+
+  /* 调试镜像（J-Link 直接读，重标 δ 零点时用）：
+   *   g_dbg_joint = 云台关节角原始值（多圈，未扣零点）
+   *   g_dbg_delta = 扣零点并归一化后的 δ
+   * 标定：把枪口对到"新车头"方向，读 g_dbg_joint，把 g_delta_offset 写成该值。 */
+  g_dbg_joint = joint_raw;
+  g_dbg_delta = delta_;
+
+  /* 模式切换沿：进分离模式那一刻重新取航向保持目标（见 GenerateCommands 的 kSeparate） */
+  if (mode_ != last_mode_) {
+    if (mode_ == ChassisMode::kSeparate) {
+      sep_hold_valid_ = false;
+    }
+    last_mode_ = mode_;
+  }
 
   /* 台架模式：轮子测试用不到 IMU，一并绕过（正式使用必须关掉台架模式） */
   inputs_.imu_ready = bench ? true : imu_ready;
@@ -559,10 +615,25 @@ void Robot::GenerateCommands(float dt)
     }
     case ChassisMode::kSeparate:
     default: {
-      /* 分离模式：只平移，底盘不主动转（右摇杆横向留给云台瞄枪口，方案 A） */
+      /* 分离模式：平移 + **航向保持**（2026-11-17 新需求：手不能拨动车头）。
+       * 目标 = 进分离那一刻的车头绝对朝向（sep_hold_valid_ 失效时重新取）。
+       * w 由 P 环给出并限幅；不打滑时不顶、被外力拧歪才回正。 */
       command_.vx = vx_cmd;
       command_.vy = vy_cmd;
-      command_.w = 0.0f;
+      if ((g_sep_hold_enable != 0u) && (imu_ != nullptr)) {
+        if (!sep_hold_valid_) {
+          sep_yaw_target_ = imu_->yaw();
+          sep_hold_valid_ = true;
+        }
+        const float err = WrapToPi(sep_yaw_target_ - imu_->yaw());
+        /* PD：P 把车拧回来，D（−kd·ω）负责刹车，避免冲过头来回摆。
+         * ω 用 IMU 的 yaw 角速度（不是误差微分），手推时同样生效。 */
+        const float rate = imu_->yawRate();
+        command_.w =
+            Clamp(g_sep_hold_kp * err - g_sep_hold_kd * rate, -kSepHoldMaxW, kSepHoldMaxW);
+      } else {
+        command_.w = 0.0f;
+      }
       break;
     }
   }
@@ -589,15 +660,25 @@ void Robot::GenerateCommands(float dt)
 float Robot::kFrameDelta(void) const
 {
   if (g_ignore_delta == 1u) {
-    return 0.0f;
+    return 0.0f;   /* 调试：直接用旧车体系（验四轮方向时用），不含 90° 偏移 */
   }
-  if (mode_ != ChassisMode::kSpin) {
-    return 0.0f;
-  }
-  /* 角速度超前补偿：见 g_frame_lead 的说明。
-   * δ_eff = δ − lead·ω。限到 ±0.6 rad（34°），防止 IMU 异常时把平移拧飞。 */
-  if (imu_ == nullptr) {
-    return delta_;
+
+  /* ===== 2026-11-17 定稿：**所有模式**都用 δ（平移随枪口）=====
+   * 曾经只在"小陀螺"用 δ、分离/跟随用车体系，现场立刻暴露两个问题：
+   *   · 分离模式：底盘航向保持不动，于是"前"在世界上是固定方向，转云台不跟 → 用户预期不符
+   *   · 跟随模式：底盘对齐后 δ→0，只剩 g_front_yaw 的 90°，前推直接偏到左边 90°
+   * 根因是把两件事混在一起了：
+   *   a) 机械上枪口相对车体物理坐标系本来就偏 90°（g_front_yaw 就是它）；
+   *   b) "前推朝哪走"应该恒等于枪口。
+   * 只要解算统一用 (δ + g_front_yaw)，世界方向 = R(枪口方位) —— a 被消掉，
+   * 所有模式都满足 b。推导：世界方向 = R(θ车 + δ + f)，而 δ = φ枪 − θ车 − a，
+   * 代入得 R(φ − a + f)，取 f = a 即得 R(φ)（正对枪口）。
+   *
+   * 角速度超前补偿只对小陀螺做：那是"底盘在自转、坐标系也在转"才有的相位滞后；
+   * 分离/跟随的 ω≈0，加了也没用，反而可能引入噪声。 */
+  float frame = WrapToPi(delta_ + g_front_yaw);
+  if (mode_ != ChassisMode::kSpin || imu_ == nullptr) {
+    return frame;
   }
   float lead = g_frame_lead * imu_->yawRate();
   if (lead > 0.6f) {
@@ -605,7 +686,7 @@ float Robot::kFrameDelta(void) const
   } else if (lead < -0.6f) {
     lead = -0.6f;
   }
-  return WrapToPi(delta_ - lead);
+  return WrapToPi(frame - lead);
 }
 
 void Robot::OutputWheels(float dt)
@@ -693,6 +774,9 @@ void Robot::OutputZero(void)
   command_.setZero();
   /* 退出闭环就解除武装：再次进入 Working 必须重新「摇杆回中」才允许输出 */
   arm_ms_ = 0.0f;
+  /* 航向保持目标作废：下次进 Working 时按"当时"的车头朝向重新取，
+   * 否则会拿上一次会话的旧目标，一上电就往旧方向转。 */
+  sep_hold_valid_ = false;
   if (chassis_ != nullptr) {
     chassis_->Stop();
   }
