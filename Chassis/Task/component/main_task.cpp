@@ -51,14 +51,15 @@ constexpr float kHalfTrackM = 0.15338f;      /* 半轮距 L/2 = 左右距离/2 *
  *   当时的 0.5 已经够盖住 0.395；这次指令上限又提了一档，所以跟着取 0.75。
  *
  * ⚠️ 平移上限仍由 chassis.hpp 的 max_vx/max_vy 管着，所以提闸门不会让车变快。
- * 恢复顺序：0.3 → 0.5 → **0.75（当前）** → 1.0 → 验收值 4.5。
+ * 恢复顺序：0.3 → 0.5 → 0.75 → **0.90（当前）** → 1.0 → 验收值 4.5。
  *
- * 0.75 是按"最坏情况"定的：左摇杆推到**对角**再叠加自旋打满时，单轮要
- *   max_vx + max_vy + (半轴距+半轮距)·max_spin_w = 0.20 + 0.20 + 0.307 = 0.707
- * 留一点余量取 0.75 —— 这样任何正常的"平移+自旋"组合都不会被等比削减。
+ * 0.90 是按"最坏情况"定的：左摇杆推到**对角**再叠加自旋打满时，单轮要
+ *   max_vx + max_vy + (半轴距+半轮距)·max_spin_w = 0.20 + 0.20 + 0.307×1.50 = 0.860
+ * 留一点余量取 0.90 —— 这样任何正常的"平移+自旋"组合都不会被等比削减。
  * 下面的 static_assert 把这个关系钉死：以后只改 chassis.hpp 的速度上限、
- * 忘了改这里，会直接编译失败而不是"悄悄变慢"。 */
-constexpr float kMaxWheelVelMps = 0.75f;
+ * 忘了改这里，会直接编译失败而不是"悄悄变慢"。（2026-11-17 把 max_spin_w
+ * 提到 1.50 时，正是这个断言把闸门从 0.75 顶到 0.90 的。） */
+constexpr float kMaxWheelVelMps = 0.90f;
 
 constexpr robot::ChassisLimits kCommandLimits{};
 static_assert(kMaxWheelVelMps >= kCommandLimits.max_vx + kCommandLimits.max_vy +
