@@ -358,6 +358,14 @@ void TestDbusFrameValid()
   const uint8_t good[18] = {0x30, 0xA4, 0x34, 0x00, 0x29, 0x6D, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   CHECK_TRUE(IsDbusFrameValid(good, 18));
 
+  /* 回归用例（2026-11-17 现场事故）：这一帧**完全合法**（拨杆 3/3），
+   * 但 0x00|0x04|0x20|0x00|0xF5|0xFA == 0xFF，旧代码用"按位或"判"整帧全 FF"，
+   * 于是把它误判成非法 → 左摇杆推到 0.369 时遥控整条掉线、状态机 Dead。
+   * 这个用例锁住"必须逐字节判断全 0/全 FF"。 */
+  const uint8_t or_to_ff[18] = {0x00, 0x04, 0x20, 0x00, 0xF5, 0xFA, 0, 0, 0, 0,
+                                0,    0,    0,    0,    0,    0,    0, 0x04};
+  CHECK_TRUE(IsDbusFrameValid(or_to_ff, 18));
+
   /* 接收机掉线：缓冲区全 0 —— 这就是现场"云台自己匀速转"的元凶 */
   const uint8_t zeros[18] = {0};
   CHECK_TRUE(!IsDbusFrameValid(zeros, 18));

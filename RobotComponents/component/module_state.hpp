@@ -350,11 +350,26 @@ inline bool IsDbusFrameValid(const uint8_t* data, uint16_t size)
   if ((data == nullptr) || (size < kDbusFrameLen)) {
     return false;
   }
-  uint8_t acc = 0u;
+  /* ⚠️ 「整帧全 0 / 全 FF」必须逐字节判断，不能用"或起来"！
+   * 旧写法 `acc |= data[i]; if (acc == 0xFF) return false;` 是错的：
+   * 按位或等于 0xFF 只说明"这些字节或起来是 FF"，不等于每个字节都是 FF。
+   * 实测事故（2026-11-17）：左摇杆推到 0.369 时帧里出现 0xF5 和 0xFA，
+   * 0xF5|0xFA = 0xFF → 整帧被判非法 → 遥控瞬间掉线 → 状态机 Dead → 推杆没反应。
+   * 判据也可能被别的字节组合撞到，属于"随机让遥控失灵"的定时炸弹。 */
+  bool all_zero = true;
+  bool all_ff = true;
   for (uint16_t i = 0; i < kDbusFrameLen; ++i) {
-    acc = static_cast<uint8_t>(acc | data[i]);
+    if (data[i] != 0x00u) {
+      all_zero = false;
+    }
+    if (data[i] != 0xFFu) {
+      all_ff = false;
+    }
+    if (!all_zero && !all_ff) {
+      break;
+    }
   }
-  if ((acc == 0x00u) || (acc == 0xFFu)) {
+  if (all_zero || all_ff) {
     return false;
   }
   /* 拨杆位在 byte5 的高 4 位：左占 bit2-3，右占 bit0-1 */

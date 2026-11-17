@@ -74,24 +74,22 @@ volatile uint32_t g_dbus_ok[kDbusPorts] = {0u, 0u, 0u};
 volatile uint32_t g_dbus_err[kDbusPorts] = {0u, 0u, 0u};
 UART_HandleTypeDef* const kDbusUart[kDbusPorts] = {&huart3, &huart1, &huart6};
 
-/* ===== DBUS 原始流抓取（只采数据，不改解码逻辑）=====
+/* ===== DBUS 接收方式：ReceiveToIdle（2026-11-17 抓包定案）=====
  *
- * 背景：g_dbus_ev ≈ 72/秒、g_dbus_ok ≈ 0，说明串口确实在收、但帧内容判非法。
- * 「帧长不是 18」「帧头是 0x20 0x00」「帧间隔多少 ms」这三个数必须用真数据定，
- * 靠推测改解码已经浪费了一整天（而且回退过两次可能有用的改动）。
+ * 抓包结论（128 块原始数据，见 docs/dbus_capture.md）：
+ *   一帧就是 **18 字节**、**没有 0x20 帧头**、帧间隔 **14 ms**（71.4 帧/秒）、
+ *   块内**偏移 0** 就是 DT7::decode 的 data[0]，合法率 100%。
+ *   首字节 `00 04` 是摇杆 ch0 的 11 bit 低/高字节（中位 1024），不是帧头。
  *
- * 这里做的是【最小侵入的数据采集】，除了接收方式之外不改任何解码/校验：
- *   - 只把 USART3 的接收换成 ReceiveToIdle（按总线空闲切块，不再假设帧长）
- *   - 每切出一块记一条：到达时刻(ms) + 块长 + 前 64 字节
- *   - 写进固定数组（128 条），用 J-Link savebin 导出，由 tools/dbus_capture.py 离线分析
+ * 原来「按 18 字节定长接收」的致命问题不是帧长，而是**滑窗后永不重同步**：
+ *   上电若正好从帧中间开始数，第一个 18 字节就跨两帧 → 判非法；之后每次都在
+ *   帧中间结束 → 错位被永久保留，g_dbus_ok 恒 0，只有重启才可能重新对上一次。
  *
- * 判读靠 tools/dbus_capture.py，不靠"遥控有没有反应"（那是不等价的判据）。
- *
- * ⚠️ 采集开启期间 g_dbus_ev / g_dbus_ok 都是 0 —— 那条 18 字节定长路径根本没被使用，
- *    别把它当成"串口没数据"。抓完把 kDbusCapture 改回 false 就完全恢复旧行为。
+ * 现在按总线空闲切块：每块天然是一整帧，校验不过就丢、下一块自动对齐。
+ * kDbusCapture 只是"顺便把原始块存进 RAM 供离线分析"的开关，默认关（已抓完）。
  */
-constexpr bool kDbusCapture = true;
-constexpr uint8_t kDbusCapPort = 0u;      /* 0 = USART3（实测有信号的那一路） */
+constexpr bool kDbusCapture = false;
+constexpr uint8_t kDbusIdlePort = 0u;     /* 0 = USART3（实测有信号的那一路） */
 constexpr uint16_t kCapBlockLen = 64u;    /* 单次切块上限，必须大于真实帧长 */
 constexpr uint32_t kCapEntries = 128u;    /* 记录条数（72 字节/条，约 9.2 KB RAM） */
 constexpr uint16_t kCapDataLen = 64u;
@@ -122,7 +120,7 @@ struct DbusCapBlock {
 };
 
 DbusCapBlock g_dbus_cap = {};
-uint8_t g_dbus_cap_buf[kCapBlockLen] = {};
+uint8_t g_dbus_idle_buf[kCapBlockLen] = {};   /* USART3 的 ReceiveToIdle 接收缓冲 */
 
 /* 布局锚点：tools/dbus_capture.py 按这些偏移解析导出的 bin。
  * 这里用 static_assert 钉死，改结构体忘了改脚本（或反过来）会当场编译失败。 */
@@ -148,9 +146,10 @@ void DbusArm(uint8_t idx)
   if (idx >= kDbusPorts) {
     return;
   }
-  /* 抓取模式：只对指定口用 ReceiveToIdle，其余口保持原来的 18 字节定长接收 */
-  if (kDbusCapture && (idx == kDbusCapPort)) {
-    if (HAL_UARTEx_ReceiveToIdle_IT(kDbusUart[idx], g_dbus_cap_buf, kCapBlockLen) !=
+  /* USART3 走 ReceiveToIdle：按空闲切块，天然对齐到帧边界。
+   * 其余两个口保持 18 字节定长接收（它们只是"探测有没有信号"，不参与解码）。 */
+  if (idx == kDbusIdlePort) {
+    if (HAL_UARTEx_ReceiveToIdle_IT(kDbusUart[idx], g_dbus_idle_buf, kCapBlockLen) !=
         HAL_OK) {
       g_dbus_cap.arm_fail = g_dbus_cap.arm_fail + 1u;
     }
@@ -169,7 +168,7 @@ void DbusCaptureRecord(uint16_t size)
     e->tick = hello_world::tick::GetTickMs();
     e->len = len;
     for (uint16_t k = 0u; k < len; ++k) {
-      e->data[k] = g_dbus_cap_buf[k];
+      e->data[k] = g_dbus_idle_buf[k];
     }
     g_dbus_cap.n = i + 1u;
   }
@@ -197,16 +196,16 @@ void DbusConfigurePort(uint8_t idx)
 }
 
 /** 处理一整帧：只有内容合法才刷新「遥控在线」，否则让它超时掉线 */
-void DbusHandleFrame(uint8_t idx, uint16_t size)
+void DbusHandleFrame(uint8_t idx, const uint8_t* data, uint16_t size)
 {
   g_dbus_ev[idx] = g_dbus_ev[idx] + 1u;
-  if (!robot::IsDbusFrameValid(g_dbus_buf[idx], size)) {
+  if (!robot::IsDbusFrameValid(data, size)) {
     return;
   }
   g_dbus_ok[idx] = g_dbus_ok[idx] + 1u;
   hello_world::remote_control::DT7* rc = GetRemoteControl();
   if (rc != nullptr) {
-    rc->decode(g_dbus_buf[idx]);
+    rc->decode(data);
   }
   robot::Robot* rb = GetRobot();
   if (rb != nullptr) {
@@ -315,15 +314,17 @@ extern "C" void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart)
   if (idx >= kDbusPorts) {
     return;
   }
-  DbusHandleFrame(idx, kDbusLen);
+  DbusHandleFrame(idx, g_dbus_buf[idx], kDbusLen);
   /* 必须重新挂上，否则只能收到一帧 */
   DbusArm(idx);
 }
 
 /**
  * @brief       ReceiveToIdle 回调：一块数据（一个空闲间隔）收完
- * @note        只有被切成 ReceiveToIdle 的那一路（kDbusCapPort）会进这里，用来抓原始流。
- *              这里【不做】任何解码 —— 目的只是把字节原样存进 g_dbus_cap。
+ * @note        USART3 走这条路。空闲间隔天然把帧切开，所以每块直接当**一整帧**处理：
+ *               - 校验通过 → 解码 + 刷新"遥控在线"
+ *               - 校验不过（如上电瞬间那个半帧）→ 丢掉，下一块自动重新对齐
+ *              这就是"定长接收滑窗后永不恢复"的正解。
  */
 extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t Size)
 {
@@ -331,10 +332,13 @@ extern "C" void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t S
   if (idx >= kDbusPorts) {
     return;
   }
-  if (!(kDbusCapture && (idx == kDbusCapPort))) {
+  if (idx != kDbusIdlePort) {
     return;
   }
-  DbusCaptureRecord(Size);
+  DbusHandleFrame(idx, g_dbus_idle_buf, Size);
+  if (kDbusCapture) {
+    DbusCaptureRecord(Size);   /* 需要离线分析时才开，默认关 */
+  }
   DbusArm(idx);   /* 必须重新挂上，否则只收到一块 */
 }
 

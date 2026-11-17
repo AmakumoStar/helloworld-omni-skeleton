@@ -28,7 +28,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('uid', 'alive', 'dump-dbus', 'flash')]
+    [ValidateSet('uid', 'alive', 'dump-dbus', 'flash', 'bench')]
     [string]$Action = 'uid',
 
     [ValidateSet('chassis', 'gimbal')]
@@ -41,7 +41,17 @@ param(
     [string]$OutFile = '',
 
     # flash 时必须给：先跑 -Action uid 看清楚是哪块板
-    [string]$ExpectedUid = ''
+    [string]$ExpectedUid = '',
+
+    # bench：开环占空比（-1~1）。开环直接给电流，空载转速很高：
+    #   0.005 ≈ 0.1 A（最慢，推荐先试这个）
+    #   0.01  ≈ 0.2 A
+    #   0.02  ≈ 0.4 A
+    #   0.05  ≈ 1 A  ← 昨天用这个，轮子实测 20+ rad/s（≈1.7 m/s），太快
+    [double]$Duty = 0,
+
+    # bench：关掉台架模式并把 duty 归零
+    [switch]$BenchOff
 )
 
 $ErrorActionPreference = 'Stop'
@@ -176,13 +186,16 @@ function Do-Alive() {
 # ---------------------------------------------------------------- dump-dbus
 function Do-DumpDbus() {
     $addr = Get-SymbolAddress 'g_dbus_cap'
-    Write-Host ("g_dbus_cap @ {0} （结构体 9364 字节）" -f $addr)
+    # ⚠️ J-Link Commander 的数字参数**一律按十六进制解析**：写 9364 会被当成 0x9364=37732 字节。
+    #    所以长度必须写成 0x2494（= 9364 十进制，与 comm_task.cpp 里的 static_assert 对齐）。
+    $size = 0x2494
+    Write-Host ("g_dbus_cap @ {0} （结构体 {1} 字节 = 0x{1:X}）" -f $addr, $size)
     # 先把已有的文件删掉：J-Link 不会覆盖已存在文件时会静默保留旧内容
     Remove-Item $OutFile -ErrorAction SilentlyContinue
     $out = Invoke-JLink @(
         'si SWD', 'speed 1000', 'connect',
         $FreezeIwdg,
-        ('savebin "{0}", {1}, 9364' -f $OutFile, $addr),
+        ('savebin "{0}", {1}, 0x{2:X}' -f $OutFile, $addr, $size),
         'r', 'g', 'q'
     ) 'dump'
     if (-not (Test-Path $OutFile)) {
@@ -194,10 +207,11 @@ function Do-DumpDbus() {
     Write-Host ("导出     : {0}（{1} 字节）" -f $OutFile, $bytes.Length)
     if ($bytes.Length -lt 16) { throw '文件太短，savebin 长度或地址不对' }
     $magic = [BitConverter]::ToUInt32($bytes, 0)
-    if ($magic -ne 0xDB05CA90) {
+    # 按 16 进制字符串比：0xDB05CA90 超过 Int32 范围，直接写数字字面量会变成负数而比较失败
+    if (('{0:X8}' -f $magic) -ne 'DB05CA90') {
         Write-Host ("!! 头部 magic = 0x{0:X8}，预期 0xDB05CA90" -f $magic)
         Write-Host '   → 符号地址不对，或固件不是 kDbusCapture 版本'
-        Write-Host '   前 16 字节: ' (($bytes[0..15] | ForEach-Object { $_.ToString('x2') }) -join ' ')
+        Write-Host ('   前 16 字节: ' + (($bytes[0..15] | ForEach-Object { $_.ToString('x2') }) -join ' '))
         return
     }
     $n = [BitConverter]::ToUInt32($bytes, 4)
@@ -221,9 +235,12 @@ function Do-Flash() {
         throw ("UID 不匹配：读到 {0}，预期 {1}。拒绝烧录。" -f $uid.Uid, $ExpectedUid)
     }
     Write-Host 'UID 校验通过，开始烧录…'
+    # ⚠️ loadfile 之前必须冻结 IWDG：擦除+写入要几百毫秒到几秒，而 IWDG 在 CPU 被 halt 时
+    #    仍然计数（底盘 300 ms）。中途复位会让 flash 写一半 —— 轻则校验失败，重则开不了机。
+    #    DBGMCU 属于调试域，写一次管到下次掉电。
     $out = Invoke-JLink @(
         'si SWD', 'speed 1000', 'connect',
-        'r', 'h',
+        $FreezeIwdg,
         ('loadfile "{0}"' -f $Elf),
         'r',
         'mem32 0x08000000 2',
@@ -251,10 +268,52 @@ function Do-Flash() {
     }
 }
 
+# ---------------------------------------------------------------- bench
+# 台架/开环测试：绕 PID 直接给四轮同一个电流，车必须架空！
+# 为什么要走脚本：duty 是 float，J-Link 的 w4 只收 IEEE-754 位模式，手算容易错。
+function Do-Bench() {
+    $addrEnable = Get-SymbolAddress 'g_bench_enable'
+    $addrDuty = Get-SymbolAddress 'g_bench_open_duty'
+
+    if ($BenchOff -or ($Duty -eq 0)) {
+        Write-Host '关台架模式：g_bench_enable = 0，g_bench_open_duty = 0'
+        $out = Invoke-JLink @(
+            'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+            ('w4 {0} 00000000' -f $addrEnable),
+            ('w4 {0} 00000000' -f $addrDuty),
+            'g', 'q'
+        ) 'benchoff'
+    } else {
+        if ([math]::Abs($Duty) -gt 0.05) {
+            throw ("duty={0} 太大了：开环是直接给电流，没有速度限幅。0.05 实测就有 20+ rad/s（≈1.7 m/s）。先试 0.005 / 0.01。" -f $Duty)
+        }
+        $bits = '{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([float]$Duty), 0)
+        Write-Host ("开台架模式 + 开环 duty={0}（{1}）" -f $Duty, $bits)
+        $out = Invoke-JLink @(
+            'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+            ('w4 {0} 5A5A5A5A' -f $addrEnable),
+            ('w4 {0} {1}' -f $addrDuty, $bits),
+            'g', 'q'
+        ) 'benchon'
+    }
+
+    Start-Sleep -Milliseconds 400
+    $chk = Invoke-JLink @(
+        'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+        ('mem32 {0} 2' -f $addrDuty),   # duty 和 enable 在内存里相邻：先 duty 后 enable
+        'q'
+    ) 'benchchk'
+    ($chk -split "`r?`n") | Where-Object { $_ -match '^[0-9A-F]{8} =' }
+    Write-Host ("地址       : enable={0}  duty={1}" -f $addrEnable, $addrDuty)
+    Write-Host '判读       : enable 读到 5A5A5A5A = 已开；读到 0 = 已关'
+    Write-Host '下一步     : 看四个轮子是否同向慢转；测完用 -Action bench -BenchOff 收工'
+}
+
 # ---------------------------------------------------------------- main
 switch ($Action) {
     'uid'       { $null = Do-Uid }
     'alive'     { $null = Do-Alive }
     'dump-dbus' { Do-DumpDbus }
     'flash'     { Do-Flash }
+    'bench'     { Do-Bench }
 }

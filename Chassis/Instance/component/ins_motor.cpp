@@ -26,6 +26,7 @@
 
 namespace
 {
+using hello_world::motor::kDirFwd;
 using hello_world::motor::kDirRev;
 using hello_world::motor::M3508;
 using hello_world::motor::OptionalParams;
@@ -46,9 +47,18 @@ constexpr int kWheelCount = static_cast<int>(hello_world::chassis_ik_solver::kWh
  *    方向：手转轮子看 angle() 增减，不符就把 kDirFwd 改成 kDirRev
  *    偏移：把轮子转到机械零点，读 angle()，填进 offset */
 constexpr uint8_t kWheelId[kWheelCount] = {1u, 2u, 3u, 4u};
-/* 已补全版考核说明 6.2：四个轮子方向均为「反向」，角度偏移均为 0 */
-constexpr hello_world::motor::Dir kWheelDir[kWheelCount] = {kDirRev, kDirRev,
-                                                            kDirRev, kDirRev};
+/* 轮序：0=LF 1=LB 2=RB 3=RF
+ *
+ * ⚠️ 2026-11-17 实车标定修正：原来四个都是 kDirRev，落地一测就暴露了问题 ——
+ *    前推左摇杆，车**原地顺时针转**（不是直行），横推时轮子互相顶住发出堵转声。
+ *    原因：麦轮车左右两侧的电机/减速器是**镜像安装**的，"同一个 dir" 在左侧是往前推、
+ *    在右侧就是往后推 → 左前右后 → 自转。横移时对角两轮本该反向，方向错的那一对互顶。
+ *    判据：前推时车顺时针（往右）转 ⇒ 左侧两轮方向是对的、右侧两轮反了，
+ *    所以只把右侧（RB、RF）从 kDirRev 改成 kDirFwd。
+ *    改完的验证：落地前推应直行；若要再翻一次（车往后走），把四个一起反过来即可。 */
+constexpr hello_world::motor::Dir kWheelDir[kWheelCount] = {
+    kDirRev, kDirRev,   /* LF, LB —— 左侧：保持 kDirRev */
+    kDirFwd, kDirFwd};  /* RB, RF —— 右侧：镜像安装，方向要反过来 */
 constexpr float kWheelAngleOffset[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 OptionalParams MakeWheelParams(int idx)

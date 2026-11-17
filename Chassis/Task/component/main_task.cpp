@@ -41,7 +41,11 @@ constexpr float kControlPeriodS = 0.001f;
 constexpr float kWheelRadiusM = 0.07786f;    /* 轮半径 R */
 constexpr float kHalfWheelbaseM = 0.15338f;  /* 半轴距 W/2 = 前后距离/2 */
 constexpr float kHalfTrackM = 0.15338f;      /* 半轮距 L/2 = 左右距离/2 */
-constexpr float kMaxWheelVelMps = 0.5f;   /* 单轮线速度上限（首次试转临时限幅，改回 4.5） */
+/* 单轮线速度上限（逆解后的最终闸门）。
+ * 2026-11-17 第二次提速档 0.3 m/s ≈ 轮子 3.9 rad/s（≈37 rpm）。
+ * 这是"最后一道限幅"：任何指令（平移、自转、跟随环）解到轮子上都会被它截住。
+ * 恢复顺序：0.3（当前）→ 0.5 → 1.0 → 验收值 4.5。 */
+constexpr float kMaxWheelVelMps = 0.3f;
 
 /* 跟随环 PID（w 由「云台朝向 − 车头朝向」闭环给出） */
 hello_world::pid::Pid::Config MakeFollowConfig()

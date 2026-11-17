@@ -45,7 +45,14 @@ void MX_CAN1_Init(void)
   hcan1.Init.TimeSeg1 = CAN_BS1_9TQ;
   hcan1.Init.TimeSeg2 = CAN_BS2_4TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
-  hcan1.Init.AutoBusOff = DISABLE;
+  /* ⚠️ 手动改过（CubeMX 重新生成会覆盖，注意）：
+   * AutoBusOff 必须 ENABLE。设成 DISABLE 时，一旦 CAN 被打进 bus-off（对端没电 /
+   * 线松 / 没人 ACK 持续几十毫秒），控制器不会自己回到正常态，必须软件重新
+   * HAL_CAN_Init —— 而我们的代码只在启动时初始化一次。
+   * 现场表现：整路 CAN 永久哑掉，连接收都停，**只有重启板子才能恢复**。
+   * 2026-11-17 实测过：云台板断电期间自己被 bus-off，之后即使底盘上电，
+   * 底盘一个 0x211 也收不到；给云台板断电重上电立刻恢复。 */
+  hcan1.Init.AutoBusOff = ENABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
   hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
@@ -77,7 +84,7 @@ void MX_CAN2_Init(void)
   hcan2.Init.TimeSeg1 = CAN_BS1_9TQ;
   hcan2.Init.TimeSeg2 = CAN_BS2_4TQ;
   hcan2.Init.TimeTriggeredMode = DISABLE;
-  hcan2.Init.AutoBusOff = DISABLE;
+  hcan2.Init.AutoBusOff = ENABLE;   /* ⚠️ 手动改成 ENABLE，理由见上面 CAN1 的注释 */
   hcan2.Init.AutoWakeUp = DISABLE;
   hcan2.Init.AutoRetransmission = DISABLE;
   hcan2.Init.ReceiveFifoLocked = DISABLE;

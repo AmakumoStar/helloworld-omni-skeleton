@@ -137,6 +137,12 @@ class Robot
   /* 状态 */
   LifeState life_state_ = LifeState::kDead;
   ChassisMode mode_ = ChassisMode::kSeparate;
+  /* 模式选择器档位（带迟滞的边沿触发）：+1 = 分离，0 = 跟随，-1 = 小陀螺。
+   * mode_sel_trig_：一次拨动只允许切一档，回中后才解锁。
+   * 见 robot.cpp 里 UpdateInputs() 的实现说明。
+   * 上电默认 +1（分离）：w 只由右摇杆给，最不容易"自己动"。 */
+  int8_t mode_sel_ = 1;
+  bool mode_sel_trig_ = false;
   LifeInputs inputs_{};
   ChassisVel command_{};   ///< 本周期云台系指令
   float delta_ = 0.0f;     ///< 云台相对车头的偏航角

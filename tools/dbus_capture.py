@@ -176,9 +176,36 @@ def analyse(result, dump_name):
     first2 = Counter(bytes(e["data"][:2]).hex(" ") for e in ents if e["len"] >= 2)
     out["first2"] = first2.most_common(5)
 
-    # 拼接成连续流，试各种 (帧长, 相位)
+    # ① 先按「每个抓包块本身就是一帧」验证（ReceiveToIdle 的正确模型：
+    #    空闲间隔已经把帧切开了，块与块之间隔着十几毫秒，拼成连续流反而是错的）
+    mode_len, mode_cnt = lens.most_common(1)[0]
+    out["per_block"] = None
+    if mode_len >= DT7_LEN and mode_cnt >= 0.8 * len(ents):
+        blocks = [e for e in ents if e["len"] == mode_len]
+        best_off, best_ratio, best_smp = 0, 0.0, None
+        for off in range(0, mode_len - DT7_LEN + 1):
+            good = 0
+            smp = None
+            for e in blocks:
+                ok, left, right, chans = score_window(e["data"][off:off + DT7_LEN])
+                if ok:
+                    good += 1
+                    if smp is None:
+                        smp = {"left": left, "right": right, "ch": chans}
+            ratio = good / len(blocks)
+            if ratio > best_ratio:
+                best_off, best_ratio, best_smp = off, ratio, smp
+        out["per_block"] = {"block_len": mode_len, "offset": best_off,
+                            "ratio": round(best_ratio, 3), "sample": best_smp,
+                            "blocks": len(blocks)}
+    if out["per_block"] and out["per_block"]["ratio"] >= 0.9:
+        # 已经用块内对齐验证通过，就不必再看连续流假设了
+        out["candidates"] = []
+        return out
+
+    # ② 退一步：拼接成连续流，试各种 (帧长, 相位)
     stream = b"".join(e["data"] for e in ents)
-    cand_len = sorted({lens.most_common(1)[0][0], DT7_LEN, 20, 25, 26, 64})
+    cand_len = sorted({mode_len, DT7_LEN, 20, 25, 26, 64})
     cand_len = [l for l in cand_len if 1 <= l <= 128]
     best = []
     for fl in cand_len:
@@ -208,12 +235,17 @@ def report(out, hexdump=0):
     for ln, cnt in sorted(out["len_hist"].items()):
         print("   %3d 字节 : %d" % (ln, cnt))
     lat = out["len_hist"]
+    total_blocks = sum(lat.values())
+    mode_len0, mode_cnt0 = max(lat.items(), key=lambda kv: kv[1])
     if len(lat) == 1:
         only = list(lat)[0]
         if only >= 64:
             print("   → 块长恒为上限 %d：没有出现空闲间隔（接收机是连续流，或波特率不对）" % only)
         else:
             print("   → 块长恒定 %d 字节 = 一帧的长度（空闲间隔把它切出来了）" % only)
+    elif mode_cnt0 >= 0.8 * total_blocks:
+        print("   → 主流块长 %d 字节（占 %d/%d）：其余多半是上电瞬间被切开的不完整块，正常"
+              % (mode_len0, mode_cnt0, total_blocks))
     else:
         print("   → 块长不唯一：帧内有 >2ms 的空隙，或存在丢字节/粘帧，看下面的候选表")
 
@@ -227,6 +259,23 @@ def report(out, hexdump=0):
     print("\n-- 每条记录的前 2 字节（出现最多的组合）")
     for hx, cnt in out["first2"]:
         print("   %-8s : %d" % (hx, cnt))
+
+    pb = out.get("per_block")
+    if pb and pb["ratio"] >= 0.9:
+        s = pb["sample"] or {}
+        print("\n-- 按「每个抓包块 = 一帧」验证（ReceiveToIdle 的正确模型）")
+        print("   块长 %d 字节，块内偏移 %d 起是 DT7 的 data[0]，合法率 %.0f%%（%d 块）"
+              % (pb["block_len"], pb["offset"], pb["ratio"] * 100, pb["blocks"]))
+        print("   拨杆 L/R=%s/%s   摇杆=%s" % (s.get("left"), s.get("right"), s.get("ch")))
+        if pb["offset"] == 0 and pb["block_len"] == DT7_LEN:
+            print("\n==> 结论：一帧就是 18 字节、没有帧头，DT7::decode 直接用接收缓冲即可（偏移 0）。")
+            print("    只要用 ReceiveToIdle 按空闲切块，每块就是一整帧 —— 不需要任何偏移/搜索。")
+        else:
+            print("\n==> 结论：每块 = 一帧，帧长 %d 字节，解码从块内第 %d 字节开始"
+                  % (pb["block_len"], pb["offset"]))
+            print("    （多出的 %d 字节是帧头/尾部填充，接收时跳过即可）"
+                  % (pb["block_len"] - DT7_LEN))
+        return
 
     print("\n-- 解码候选（frame_len=切帧长度, phase=连续流里第几个字节当 DT7 的 data[0]）")
     if not out["candidates"]:

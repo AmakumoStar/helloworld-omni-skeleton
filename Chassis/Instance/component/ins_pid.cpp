@@ -24,20 +24,43 @@ namespace
 {
 constexpr int kWheelCount = static_cast<int>(hello_world::chassis_ik_solver::kWheelCount);
 
-/** 轮速环参数（整定起点） */
+}  // namespace
+
+/* ===== 轮速环在线调参（J-Link 直接写，不用重烧）=====
+ * 为什么必须可调：0.1 m/s ≈ 轮子 1.3 rad/s，这个速度下 PID 要给出约 4~6% 的电流才
+ * 推得动静摩擦。2026-11-17 开环实测：raw 655（4%）轮子不动、raw 819（5%）才起转。
+ * 而 kp=50 时，误差 1.3 rad/s 只能给出 65 raw —— 推满杆轮子也不动。
+ * 所以：kp 提高 + 加一份按方向固定的静摩擦前馈 ff，然后边测边调。
+ *
+ *   g_wheel_kp  输出/(rad/s)      起步 150（原 50 太小）
+ *   g_wheel_ki  输出/(rad/s·s)    起步 150（负责补上稳态所需的电流）
+ *   g_wheel_kd  不用              0
+ *   g_wheel_ff  静摩擦前馈 raw    起步 400（固定加在输出上，压过死区）
+ *
+ * ⚠️ ff 只在 |目标速度| > 0.05 rad/s 时加，静止时不加，避免中位抖动被放大。
+ * ⚠️ 积分限幅 ±1000，且反馈一断就 Reset（IsFeedbackFresh 看门狗），不会累积成"猛冲"。
+ */
+volatile float g_wheel_kp = 150.0f;
+volatile float g_wheel_ki = 150.0f;
+volatile float g_wheel_kd = 0.0f;
+/* 静摩擦前馈：2026-11-17 实测起转门槛 ≈ raw 655~819（开环 4% 不动、5% 才转）。
+ * 原来给 400 不够 —— 表现为"推杆后要等 0.5~1 s，等积分把输出顶上去轮子才动"。
+ * 提到 700 后一推杆就有接近门槛的电流，起步几乎无延迟。 */
+volatile float g_wheel_ff = 700.0f;
+
+namespace
+{
+/** 轮速环参数（每周期由 g_wheel_* 覆盖，这里的值只作初值） */
 hello_world::pid::Pid::Config MakeWheelConfig()
 {
   hello_world::pid::Pid::Config cfg;
-  /* ⚠️ 保守整定起点（2026-11-16 云台失控的教训）：
-   * 先把 kp 压低、ki 归零，确认轮子能平稳转起来再逐步加。
-   * ki 一旦参与，电调丢反馈时积分会一路顶到限幅，恢复瞬间四轮猛冲。 */
-  cfg.kp = 50.0f;       ///< 输出/（rad/s）
-  cfg.ki = 0.0f;        ///< 先不加积分，避免饱和
-  cfg.kd = 0.0f;        ///< 速度环不用 D
+  cfg.kp = g_wheel_kp;      ///< 输出/（rad/s）
+  cfg.ki = g_wheel_ki;      ///< 输出/（rad/s·s）
+  cfg.kd = g_wheel_kd;      ///< 速度环一般不用 D
   cfg.out_min = -3000.0f;
-  cfg.out_max = 3000.0f;
-  cfg.int_min = -500.0f;
-  cfg.int_max = 500.0f;
+  cfg.out_max = 3000.0f;    ///< 单轮最大输出 ≈ 18% 满量程，低速测试阶段的硬上限
+  cfg.int_min = -1000.0f;
+  cfg.int_max = 1000.0f;
   return cfg;
 }
 
