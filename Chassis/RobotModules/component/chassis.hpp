@@ -38,8 +38,8 @@ namespace robot
 struct ChassisLimits {
   float max_vx = 0.15f;      ///< 前后最大线速度，m/s（首次落地测试档；验收前改回 3.0）
   float max_vy = 0.15f;      ///< 左右最大线速度，m/s（同上）
-  float max_w = 0.40f;       ///< 分离 / 跟随模式最大角速度，rad/s（同上，改回 6.0）
-  float max_spin_w = 0.40f;  ///< 小陀螺最大自旋角速度，rad/s（同上，改回 8.0）
+  float max_w = 0.80f;       ///< 分离 / 跟随模式最大角速度，rad/s（2026-11-17 由 0.40 提高；验收改回 6.0）
+  float max_spin_w = 0.80f;  ///< 小陀螺最大自旋角速度，rad/s（同上，验收改回 8.0）
 };
 
 /* Exported types ------------------------------------------------------------*/

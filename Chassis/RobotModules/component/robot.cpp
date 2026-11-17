@@ -75,12 +75,38 @@ constexpr uint32_t kBenchMagic = 0x5A5A5A5Au;
 volatile uint32_t g_force_mode = 0u;
 volatile uint32_t g_estop_force = 0u;
 
-/* g_ignore_delta：1 = 把 δ 当成 0（指令按**车体系**解算，不随云台朝向旋转）。
- * 用途：云台和车头有夹角时（今天实测 δ=1.95 rad ≈ 112°），前推左摇杆会变成
- * "侧移 + 后退"的合成 —— 因为指令本来定义在**云台坐标系**，这是设计行为
- * （小陀螺模式"平移仍随枪口"就靠它）。测方向时先用它把 δ 清零，避免把
- * 坐标变换误当成"逆解/接线错误"。默认 0 = 正常按云台系解算。 */
-volatile uint32_t g_ignore_delta = 0u;
+/* g_ignore_delta：1 = **平移指令**按车体系解算（不随云台朝向旋转）。
+ * ⚠️ 注意它只影响平移，不影响跟随模式：跟随环算 w 仍然用真实 δ
+ *    （见 OutputWheels/GenerateCommands 里的 frame_delta）。
+ *
+ * 2026-11-17 决定先用 1（方案 A）：云台关节角的零点虽然标定出来了，
+ * 但标定后只要云台一动，方向就跟着转，操作手反馈"不如按车体走直观"。
+ * 正式验收若要演示"平移随枪口"，把它改成 0 并确认 g_delta_offset 已标定。 */
+volatile uint32_t g_ignore_delta = 1u;
+
+/* g_delta_offset：云台关节角的**零点标定**（rad），δ 使用 (关节角 − 该值)。
+ * 为什么需要：DM 电机报的是编码器关节角，它的 0 位和"车头方向"没有固定关系。
+ * 不标定零点，"前推 = 沿枪口走"虽然数学上成立，但操作起来方向全乱。
+ * 2026-11-17 实测标定：把云台摆到正对车头时读到的关节角是 2.661 rad（152.5°），
+ * 但按该值标定后跟随模式收敛时枪口仍右偏 45°（47.2°），说明人眼对齐有误差。
+ * 于是在分离模式（底盘不转）下重新精确标定：offset 再加 0.823 → **3.4842**。
+ * 换车/换电机/重新装过后必须重新标定这个值。
+ * 标定方法：云台正对车头，读 delta_（g_delta_offset=0 时即原始关节角），写回此处。 */
+volatile float g_delta_offset = 3.4842f;
+
+/* ===== 跟随环在线整定（J-Link 直接写）=====
+ * 2026-11-17 实测：δ=-0.211 rad 时切到跟随模式，车**左右反复摆了几下**才停。
+ * 原因是 kp=4.0 相对限幅太大：w = 4×0.211 = 0.84 rad/s，而 max_w 只有 0.40，
+ * 输出直接饱和成"满舵"→ 冲过头 → 反向再冲 → 欠阻尼振荡。
+ * 改成 kp=1.5（δ=0.21 rad 时只给 0.32 rad/s，不饱和）+ kd=0.30（加阻尼）。
+ * 手感目标：转云台 90° 时车头平滑追过去、不来回摆。
+ *
+ * 2026-11-17 实车再下调：kp=1.5/kd=0.30 时仍有轻微来回摆（云台不动、只有车在摆，
+ * 说明是跟随环自身的极限环）。最终在线调到 kp=0.8 / kd=0.15 后基本不摆，
+ * 2026-11-17 最终定稿：kp=1.2 / kd=0.20。配合 max_w 由 0.40 提到 0.80，
+ * 转 90° 的时间从 3.9 s 缩短到约 2 s，且仍不来回摆。 */
+volatile float g_follow_kp = 1.2f;
+volatile float g_follow_kd = 0.20f;
 
 namespace
 {
@@ -235,9 +261,11 @@ void Robot::UpdateInputs(void)
   /* ---- 双板通讯 ---- */
   const bool peer_online_raw = (comm_ != nullptr) && (!comm_->isOffline());
   delta_ = peer_online_raw ? comm_->gimbal_data().yaw : 0.0f;
-  if (g_ignore_delta == 1u) {
-    delta_ = 0.0f;   /* 调试：按车体系解算，见 g_ignore_delta 的注释 */
-  }
+  /* 关节角零点标定：云台正对车头时把当时读到的值写进 g_delta_offset，
+   * 之后 δ≈0 就代表"枪口正对车头"。见 g_delta_offset 的注释。
+   * ⚠️ 这里保留**真实 δ**（跟随模式要用它算 w）；
+   *    只有"平移坐标系"会因为 g_ignore_delta=1 而用 0，见 GenerateCommands。 */
+  delta_ = WrapToPi(delta_ - g_delta_offset);
 
   /* 台架模式：轮子测试用不到 IMU，一并绕过（正式使用必须关掉台架模式） */
   inputs_.imu_ready = bench ? true : imu_ready;
@@ -291,7 +319,7 @@ void Robot::GenerateCommands(float dt)
     command_.vx = g_bench_vx * lim.max_vx;
     command_.vy = g_bench_vy * lim.max_vy;
     command_.w = g_bench_w * lim.max_w;
-    chassis_->SetCommand(command_, delta_);
+    chassis_->SetCommand(command_, kFrameDelta());
     return;
   }
 
@@ -325,12 +353,25 @@ void Robot::GenerateCommands(float dt)
 
   const float vx_cmd = lv_dz * lim.max_vx;
   const float vy_cmd = -lh_dz * lim.max_vy;
-  /* 右摇杆横向 → 原地转向（右推为顺时针，即负 w） */
-  const float w_stick = -rh_dz * lim.max_w;
+  /* ⚠️ 右摇杆横向**不再**驱动底盘转向（方案 A，2026-11-17）。
+   * 原因：同一根轴同时被用于「底盘 w」和「云台 yaw_des」，操作上分不清 ——
+   * 想转车头时枪口跟着甩，跟随模式反而追不上。
+   * 现在右摇杆横向只用来瞄枪口（见 Update() 里的 yaw_des）；
+   * 需要"原地转"请进跟随模式：转云台，车头自动追过去。 */
 
   switch (mode_) {
     case ChassisMode::kFollow: {
-      /* w 由「云台朝向 − 车头朝向」闭环给出；δ 就是两者之差 */
+      /* w 由「云台朝向 − 车头朝向」闭环给出；δ 就是两者之差。
+       * 每周期把在线整定值写进跟随环（set_config 不动积分，改完立刻生效）。 */
+      hello_world::pid::Pid::Config fc;
+      fc.kp = g_follow_kp;
+      fc.ki = 0.0f;
+      fc.kd = g_follow_kd;
+      fc.out_min = -6.0f;
+      fc.out_max = 6.0f;
+      fc.int_min = -2.0f;
+      fc.int_max = 2.0f;
+      follow_pid_.set_config(fc);
       const float w_follow = follow_pid_.UpdateErr(WrapToPi(delta_), dt);
       command_.vx = vx_cmd;
       command_.vy = vy_cmd;
@@ -347,14 +388,26 @@ void Robot::GenerateCommands(float dt)
     }
     case ChassisMode::kSeparate:
     default: {
+      /* 分离模式：只平移，底盘不主动转（右摇杆横向留给云台瞄枪口，方案 A） */
       command_.vx = vx_cmd;
       command_.vy = vy_cmd;
-      command_.w = w_stick;
+      command_.w = 0.0f;
       break;
     }
   }
 
-  chassis_->SetCommand(command_, delta_);
+  chassis_->SetCommand(command_, kFrameDelta());
+}
+
+/**
+ * @brief       平移解算用的坐标系角度
+ * @retval      0 = 车体系（g_ignore_delta = 1）；否则 = 真实 δ（云台系）
+ * @note        ⚠️ 只用于 SetCommand 的坐标系参数。跟随模式算 w 必须用真实 delta_，
+ *              否则 δ 恒为 0、跟随模式失效。
+ */
+float Robot::kFrameDelta(void) const
+{
+  return (g_ignore_delta == 1u) ? 0.0f : delta_;
 }
 
 void Robot::OutputWheels(float dt)

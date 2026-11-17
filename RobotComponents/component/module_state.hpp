@@ -247,8 +247,14 @@ inline bool AngleInRange(float angle, float lower, float upper)
  *                vy_c = −vx_g·sinδ + vy_g·cosδ
  *              该式的符号取决于「δ 的正方向」与「y 轴指向」的约定。实车若发现平移方向
  *              相反，只需把 kFrameDeltaSign 取反，无需改动任何调用点。
+ *
+ * ⚠️ 2026-11-17 实车标定：改为 -1.0f。
+ *   现象：云台正对车头（δ≈0）时前推方向正确；把云台转 90° 后，车朝**相反方向**走。
+ *   推导：δ=+90° 时本函数给出 vx_c=0、vy_c=-vx；而本工程 y 轴指向**左方**
+ *        （"右推为 −y"），所以 vy_c=-vx 是往右走 —— 与云台指向（左）差 180°。
+ *   取反后 δ=+90° 给出 vy_c=+vx（往左），与云台指向一致。
  */
-inline constexpr float kFrameDeltaSign = 1.0f;
+inline constexpr float kFrameDeltaSign = -1.0f;
 
 inline ChassisVel GimbalToChassis(const ChassisVel& vel_gimbal, float delta)
 {

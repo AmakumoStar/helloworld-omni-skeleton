@@ -113,6 +113,8 @@ class Robot
   bool deltaValid(void) const { return inputs_.peer_online; }
 
  private:
+  /** 平移解算用的坐标系角度：g_ignore_delta=1 时为 0（车体系），否则为真实 δ */
+  float kFrameDelta(void) const;
   /** 采集本周期输入，填充 inputs_ */
   void UpdateInputs(void);
   /** 执行状态迁移并处理进入动作 */
