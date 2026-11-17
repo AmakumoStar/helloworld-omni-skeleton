@@ -27,12 +27,12 @@
 |---|---|---|---|---|---|
 | B1 | 云台 yaw 环 `kp/ki/kd` | **2.0 / 0 / 0.35** | `pid_tune.hpp`（可在线改） | 只验过"能动"，未整定 | ☐ |
 | B2 | 云台 pitch 环 `kp/kd` | **5.0 / 0.12** | `main_task.cpp` | **完全没验证过** | ☐ |
-| B3 | 轮速环 `kp/ki` | **200 / 20** | `ins_pid.cpp` | 教科书起始值，从未实车跑过 | ☐ |
+| B3 | 轮速环 `kp/ki/ff` | **250 / 200 / 800** | `ins_pid.cpp`（可在线改 `g_wheel_*`） | 2026-11-17 实车：起转门槛 raw 655~819，ff=800 使起步几乎无延迟；kp 再高会在低速抖 | ☑ 初步可用 |
 | B4 | 跟随环 `kp/kd` | **4.0 / 0.05**，输出 ±6 | `main_task.cpp` | 太大会绕着云台转圈 | ☐ |
 | B5 | 摇杆死区 | **0.05** | `module_state.hpp` | 实测遥控器 `rh` 有 −0.055 偏置，可能漏过死区 → 需中位标定 | ☐ |
 | B6 | 云台 `max_torque` | **1.0** N·m（调试值） | `main_task.cpp` | 目标 3.0；多大不会甩飞结构要试 | ☐ |
-| B7 | 底盘限幅 `max_vx/vy/w/spin_w` | **0.6/0.6/2.0/2.0**（调试值） | `chassis.hpp` | 目标 3.0/3.0/6.0/8.0；8 rad/s 自旋会不会翻车要试 | ☐ |
-| B8 | 单轮速度上限 `kMaxWheelVelMps` | **1.0**（调试值） | `main_task.cpp` | 目标 4.5 | ☐ |
+| B7 | 底盘限幅 `max_vx/vy/w/spin_w` | **0.15/0.15/0.40/0.40**（首次落地档） | `chassis.hpp` | 阶梯：0.15（当前）→ 0.2 → 0.25 → 0.6 → 3.0；每次提速前先架空确认方向 | ☑ 已落地验证 |
+| B8 | 单轮速度上限 `kMaxWheelVelMps` | **0.3**（首次落地档） | `main_task.cpp` | 阶梯同上；目标 4.5。这是逆解后的最终闸门 | ☑ 已落地验证 |
 | B9 | `max_yaw_rate / max_pitch_rate` | **6.0 / 3.0** rad/s | `main_task.cpp` | 纯手感 | ☐ |
 
 ### B 类整定顺序（不能反）
@@ -64,11 +64,14 @@
 | 位置 | 现在是 | 确认后应改为 |
 |---|---|---|
 | `Chassis/Task/component/comm_task.cpp` | 0x200+0x1FF × CAN1+CAN2（4 帧/ms） | 只留确定的那一组 |
-| `Chassis/Task/component/comm_task.cpp` | `kDbusCapture = true`（DBUS 原始流抓取） | 抓完改回 false，否则 `g_dbus_ev/g_dbus_ok` 恒 0 |
+| `Chassis/Task/component/comm_task.cpp` | `kDbusCapture = false`（抓包已完成，保持关闭） | 需要重新抓包时临时改 true |
 | `Chassis/RobotModules/component/robot.cpp` | `g_bench_enable` 运行期开关（写魔数 0x5A5A5A5A 才生效，上电默认关） | 保持"上电默认关"即可，不要改成编译期 true |
+| `Chassis/RobotModules/component/robot.cpp` | `g_force_mode / g_estop_force`（调试用强制模式/急停） | 保持 0；正式使用前确认复位后为 0 |
+| `Chassis/RobotModules/component/robot.cpp` | `g_ignore_delta = 1`（把 δ 当 0） | **必须为 0**，否则"平移随枪口"这个验收点失效 |
+| `Chassis/Instance/component/ins_pid.cpp` | `g_wheel_kp/ki/ff` 在线整定 | 定稿后写回 `MakeWheelConfig()` 并同步本节 B3 |
 | `Gimbal/RobotModules/component/robot.cpp` | `kBenchTest = false` | 保持 false（自测开关） |
 | `Gimbal/inc/pid_tune.hpp` | 三个 `volatile float` 在线调参 | 定稿后写回 `MakeYawConfig()` 并注明 |
-| 三处调试限幅 | 0.6 / 1.0 / 1.0 | 恢复正式值（B6~B8） |
+| 三处调试限幅 | 0.15 / 0.3 / 1.0 | 按 B7/B8 阶梯恢复到正式值（3.0 / 4.5 / 3.0） |
 
 ---
 
