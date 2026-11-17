@@ -42,6 +42,9 @@ inline constexpr float kMahonyKi = 0.0f;
 inline constexpr float kBiasWindowS = 1.5f;
 /** 零漂收敛阈值（窗口内标准差上限），单位 rad/s */
 inline constexpr float kBiasTolRadS = 0.05f;
+/** yaw 角速度的低通系数（1 kHz 下 α=0.1 约等于 10 ms 时间常数）。
+ *  只给「小陀螺坐标系超前补偿」用：压掉振动噪声，又不至于让补偿量抖动。 */
+inline constexpr float kGyroZFilterAlpha = 0.1f;
 
 /* Exported types ------------------------------------------------------------*/
 
@@ -67,6 +70,7 @@ class Imu
     for (uint8_t i = 0; i < 3u; ++i) {
       euler_[i] = 0.0f;
     }
+    gyro_z_ = 0.0f;
   }
 
   /**
@@ -96,6 +100,10 @@ class Imu
       }
     }
 
+    /* 小陀螺坐标系补偿用的 yaw 角速度：与 euler_[2] 同一符号约定（逆时针为正）。
+     * 一阶低通只是压噪声，不参与姿态解算（解算用的是上面那组原始修正值）。 */
+    gyro_z_ += (gyro_corrected[2] - gyro_z_) * kGyroZFilterAlpha;
+
     ahrs_.update(acc, gyro_corrected);
     ahrs_.getEulerAngle(euler_);
   }
@@ -110,6 +118,12 @@ class Imu
   float roll(void) const { return euler_[0]; }
   float pitch(void) const { return euler_[1]; }
   float yaw(void) const { return euler_[2]; }
+  /**
+   * @brief       yaw 角速度（已扣零漂 + 10 ms 低通），rad/s，逆时针为正
+   * @note        用于小陀螺模式的坐标系超前补偿（见 Robot::kFrameDelta）。
+   *              不要拿它替代 euler_[2] 做姿态，它只是给补偿用的平滑值。
+   */
+  float yawRate(void) const { return gyro_z_; }
 
   /** 一次取回 [roll pitch yaw]，单位 rad */
   void getEulerAngle(float euler[3]) const
@@ -130,6 +144,7 @@ class Imu
   ahrs::Mahony ahrs_;         ///< Mahony 姿态解算
   GyroBiasEstimator bias_;    ///< 开机零漂估计
   float euler_[3] = {0.0f, 0.0f, 0.0f};  ///< [roll pitch yaw]，rad
+  float gyro_z_ = 0.0f;       ///< yaw 角速度（低通后），rad/s，给小陀螺补偿用
 };
 
 /* Exported variables --------------------------------------------------------*/

@@ -10,12 +10,12 @@
 | # | 参数 | 当前值 | 位置 | 为什么要测 | 怎么测 | 状态 |
 |---|---|---|---|---|---|---|
 | A1 | 云台 pitch 机械限位 | `-0.35 / +0.60` rad | `Gimbal/Task/component/main_task.cpp` | 估值。超限会顶结构、烧电机 | 手推到上下极限，读 `angle()`，各留 5° 余量 | ☐ |
-| A2 | 四个轮子方向 `kWheelDir` | 全 `kDirRev` | `Chassis/Instance/component/ins_motor.cpp` | 反了车会原地打转 | 手转轮子看 `vel()` 符号；或低速试跑 | ☐ |
-| A3 | δ 符号 `kFrameDeltaSign` | `1.0` | `RobotComponents/component/module_state.hpp` | 反了「前推」变「后退」 | 转云台 90° 后前推，看车往哪走 | ☐ |
+| A2 | 四个轮子方向 `kWheelDir` | `LF/LB = kDirRev`，`RB/RF = kDirFwd` | `Chassis/Instance/component/ins_motor.cpp` | 反了车会原地打转 | 手转轮子看 `vel()` 符号；或低速试跑 | ✅ 2026-11-17 实车标定 |
+| A3 | δ 符号 `kFrameDeltaSign` | `-1.0` | `RobotComponents/component/module_state.hpp` | 反了「前推」变「后退」 | 转云台 90° 后前推，看车往哪走 | ✅ 2026-11-17 实车标定 |
 | A4 | 自旋符号 `kSpinSign` | `1.0` | `Chassis/RobotModules/component/chassis_ik_solver.hpp` | 拨轮正转可能车反转 | 小陀螺模式拨轮试 | ☐ |
 | A5 | 云台 yaw 方向 / 零位 | `kDirFwd / -1.36920` | `Gimbal/Instance/component/ins_motor.cpp` | 拆装后零位会变 | 上电读 `angle()`，对齐机械零位重算 | ☐ |
 | A6 | 云台 pitch 方向 / 零位 | `kDirRev / 0.02480` | 同上 | 同上（且 pitch 目前无反馈） | 同上 | ☐ |
-| A7 | M3508 减速比 | 代码注释标「待确认」 | `Chassis/Instance/component/ins_motor.cpp` | 拓扑图写 **14**，出厂 **19.2**，差 37% | 手转轮子，对比 `angle()` 与轮子实际转角 | ☐ |
+| A7 | M3508 减速比 | 代码用 **19.2**（`3591/187`），注释标「待确认」 | `Chassis/Instance/component/ins_motor.cpp` | 拓扑图写 **14**，出厂 **19.2**，差 37%。**2026-11-17 实测：四轮 3.18 rad/s（目标 3.13）时车实际转 1.370 rad/s，而按现有常数只能转 0.807 → 整体差 1.70 倍**，这一项是最可疑的来源（1.37 倍） | ①卷尺量轮径/轴距/轮距 ②看减速箱铭牌 ③直行 2 s 量距离（标称 0.30 m）④手转轮子 5 圈读 `angle()`（一圈应 6.283 rad） | ☐ 未解决，见 `known_issues.md` 7.5 |
 | A8 | 电调 ID 与总线归属 | 0x200+0x1FF、CAN1+CAN2 全打 | `Chassis/Task/component/comm_task.cpp` | 不确定才全打，浪费带宽 | 看嗅探表出现 `0x201~0x204` 还是 `0x205~0x208` | ☐ |
 | A9 | 遥控器档位映射 | 假设 1/3/2 = 上/中/下 | `protocol.md` 第五节 | Phantom 遥控器标注完全不同 | 拨到每档读 `rc_l_switch_ / rc_r_switch_` | ☐ |
 

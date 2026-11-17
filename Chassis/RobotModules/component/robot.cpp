@@ -75,14 +75,23 @@ constexpr uint32_t kBenchMagic = 0x5A5A5A5Au;
 volatile uint32_t g_force_mode = 0u;
 volatile uint32_t g_estop_force = 0u;
 
-/* g_ignore_delta：1 = **平移指令**按车体系解算（不随云台朝向旋转）。
- * ⚠️ 注意它只影响平移，不影响跟随模式：跟随环算 w 仍然用真实 δ
- *    （见 OutputWheels/GenerateCommands 里的 frame_delta）。
+/* g_ignore_delta：调试开关，1 = **所有模式**的平移都按车体系解算（强制忽略 δ）。
+ * 默认 0（正式值）：小陀螺模式的平移随枪口，见 kFrameDelta() 的说明。
  *
- * 2026-11-17 决定先用 1（方案 A）：云台关节角的零点虽然标定出来了，
- * 但标定后只要云台一动，方向就跟着转，操作手反馈"不如按车体走直观"。
- * 正式验收若要演示"平移随枪口"，把它改成 0 并确认 g_delta_offset 已标定。 */
-volatile uint32_t g_ignore_delta = 1u;
+ * 2026-11-17 曾置 1（方案 A）：零点虽已标定，但"云台一动方向就跟着转"，操作手反馈
+ * 不如按车体走直观。2026-11-18 起改为 0：小陀螺必须随枪口（底盘在自转，车体系没
+ * 法用），其余模式仍在 kFrameDelta() 里保留车体系，兼顾操作习惯。
+ * ⚠️ 正式使用必须为 0。 */
+volatile uint32_t g_ignore_delta = 0u;
+
+/* g_frame_lead：小陀螺模式的**坐标系超前补偿系数**，单位 s（rad per rad/s）。
+ * 为什么需要：平移指令按下发那一拍的 δ 解算，但车轮/整车真正把速度做出来要 ~0.2 s；
+ * 这 0.2 s 里底盘又自转 ω·τ，于是**车实际走的直线方向 = R(ω·τ) × 枪口方向**。
+ * 2026-11-17 实测：ω≈1.37 rad/s 时前进方向向自旋侧偏 ~15° = 0.26 rad → τ≈0.19 s。
+ * 补偿公式 δ_eff = δ − g_frame_lead·ω（ω 取底盘 IMU 的 yaw 角速度）。
+ * 只在小陀螺生效；ω=0 时完全不起作用，所以静态直行不受影响。
+ * 可在线改（J-Link 写 float 位模式）：偏得更多就调小，反向就写负值。 */
+volatile float g_frame_lead = 0.19f;
 
 /* g_delta_offset：云台关节角的**零点标定**（rad），δ 使用 (关节角 − 该值)。
  * 为什么需要：DM 电机报的是编码器关节角，它的 0 位和"车头方向"没有固定关系。
@@ -108,10 +117,149 @@ volatile float g_delta_offset = 3.4842f;
 volatile float g_follow_kp = 1.2f;
 volatile float g_follow_kd = 0.20f;
 
+/* ==================== 小陀螺自旋诊断记录（只写 RAM，不参与控制）====================
+ * 为什么要有它：J-Link 的 connect 会把 CPU halt 住，单次 mem32 只能拿到一个**冻结的
+ * 快照**；而"自旋不匀速"是一段**时间过程**（正常 → 逐渐变慢 → 稳定在低转速），
+ * 必须看曲线，不能只看某一瞬间。这里在 1ms 控制周期里按 100 Hz 采样，把关键量
+ * 存进 RAM，跑完再离线导出来，不依赖调试器在线（SWD 可以先拔掉，避免绞线）。
+ *
+ * 用法（默认已开，不需要改编译开关、不需要 J-Link 在线）：
+ *   1) 上电后正常操作，进小陀螺并把拨轮推起来（|w| > 0.2 rad/s 时自动开始录）；
+ *   2) 录满 kTraceRows 条（100 Hz × 7 s）自动停；数据一直保留到复位；
+ *   3) pwsh -File tools\jlink.ps1 -Action dump-trace -Board chassis
+ *      python tools\spin_trace.py --dump spin_trace.bin
+ *   （dump-trace 顺手把 g_trace_state/g_trace_n 清零，下一次拨轮就可以再录一遍）
+ *
+ * 每行 21 个 float，列定义见 TraceTick()。
+ * 为什么不改变控制：只读 command_ / chassis_->wheel_vel() / motor->vel() / pid->out()，
+ * 一个都不写回，纯观测。
+ */
+constexpr uint32_t kTraceCols = 21u;
+constexpr uint32_t kTraceRows = 700u;              ///< 100 Hz × 7 s
+constexpr uint32_t kTraceDiv = 10u;                ///< 1 kHz / 10 = 100 Hz
+constexpr uint32_t kTraceModeSpin = 2u;            ///< robot::ChassisMode::kSpin
+constexpr float kTraceTriggerW = 0.2f;             ///< 自旋指令超过它才开始录
+
+volatile float g_trace_buf[kTraceRows][kTraceCols];
+volatile uint32_t g_trace_state = 0u;    ///< 0=待触发 1=录制中 2=录满
+volatile uint32_t g_trace_n = 0u;        ///< 已存条数
+volatile uint32_t g_trace_t0_ms = 0u;    ///< 第一条的 uwTick
+volatile uint32_t g_trace_arm = 1u;      ///< 1=允许自动触发（只写 RAM，安全）
+volatile uint32_t g_trace_mode = 0u;     ///< 触发时的模式（应为 2=Spin）
+
 namespace
 {
 /** 台架模式是否开启：魔数匹配才认，避免手滑写个 1 就把五个联锁全绕过了 */
 bool BenchOn(void) { return g_bench_enable == kBenchMagic; }
+
+/* 自旋诊断的跨周期状态（普通变量，不需要被 J-Link 看见） */
+float s_trace_prev_vel[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+float s_trace_jitter[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+uint32_t s_trace_div = 0u;
+
+/**
+ * @brief       自旋诊断采样（每个 1ms 周期调用，实际 10 个周期存一条 = 100 Hz）
+ * @param       now_ms : 当前 uwTick
+ * @param       mode   : 本周期底盘模式原始值（2 = 小陀螺）
+ * @param       w_cmd  : command_.w（拨轮给出的自旋指令）
+ * @param       delta  : 真实 δ（云台 − 车头），rad
+ * @param       tgt    : 四轮速度目标，m/s（逆解 + 限幅之后）
+ * @param       vel    : 四轮实际速度，rad/s（M3508 反馈，输出轴）
+ * @param       out    : 四轮速度环输出，raw（±16384 满量程）
+ * @param       imu_yaw: 底盘 IMU 绝对 yaw，rad（独立的"车真转了多少"证据）
+ *
+ * 列定义（每行 21 个 float，轮序 LF/LB/RB/RF）：
+ *   [0]      t_ms（相对触发时刻）
+ *   [1]      mode
+ *   [2]      w_cmd       拨轮给出的自旋指令，rad/s
+ *   [3]      delta       真实 δ（云台 − 车头），rad
+ *   [4..7]   四轮目标 m/s（逆解 + 限幅之后）
+ *   [8..11]  四轮实际 rad/s（M3508 反馈，输出轴）
+ *   [12..15] 四轮速度环输出 raw（±16384 满量程，本程序限到 ±3000）
+ *   [16..19] 四轮"1ms 级速度跳变量"（每 10ms 窗口累计 |Δvel|，rad/s）
+ *   [20]     底盘 IMU 绝对 yaw，rad
+ *
+ * jitter 列是做什么的：如果两颗 C620 被拨成同一个 ID（0x201 帧数是别人的整 2 倍的
+ * 可疑点），同一个 M3508 对象会交替收到两台车轮的反馈，vel_ 在 ±目标之间来回跳，
+ * 这一列会大到几十；正常轮子随着真实加速，累计值通常 < 1。
+ */
+void TraceTick(uint32_t now_ms, uint8_t mode, float w_cmd, float delta,
+               const float tgt[kWheelCount], const float vel[kWheelCount],
+               const float out[kWheelCount], float imu_yaw)
+{
+  /* 1) 每 1ms 累计速度跳变（跨周期，先累加再判是否该存） */
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    s_trace_jitter[i] += fabsf(vel[i] - s_trace_prev_vel[i]);
+    s_trace_prev_vel[i] = vel[i];
+  }
+
+  if (g_trace_arm == 0u) {
+    return;
+  }
+
+  /* 2) 待触发：只在"小陀螺 + 拨轮真的给了自旋"时开始，避免一上电就录到静止数据 */
+  if (g_trace_state == 0u) {
+    if ((mode == kTraceModeSpin) && (fabsf(w_cmd) > kTraceTriggerW)) {
+      g_trace_state = 1u;
+      g_trace_n = 0u;
+      g_trace_t0_ms = now_ms;
+      g_trace_mode = mode;
+      s_trace_div = 0u;
+      for (uint32_t i = 0u; i < kWheelCount; ++i) {
+        s_trace_jitter[i] = 0.0f;
+      }
+    } else {
+      return;
+    }
+  }
+  if (g_trace_state != 1u) {
+    /* 已录满：jitter 归零，避免长时间累加变成无意义的大数 */
+    for (uint32_t i = 0u; i < kWheelCount; ++i) {
+      s_trace_jitter[i] = 0.0f;
+    }
+    return;
+  }
+
+  /* 3) 抽稀到 100 Hz */
+  s_trace_div = s_trace_div + 1u;
+  if (s_trace_div < kTraceDiv) {
+    return;
+  }
+  s_trace_div = 0u;
+
+  const uint32_t row = g_trace_n;
+  if (row >= kTraceRows) {
+    g_trace_state = 2u;
+    return;
+  }
+
+  volatile float* const r = g_trace_buf[row];
+  r[0] = static_cast<float>(now_ms - g_trace_t0_ms);
+  r[1] = static_cast<float>(mode);
+  r[2] = w_cmd;
+  r[3] = delta;
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    r[4u + i] = tgt[i];
+  }
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    r[8u + i] = vel[i];
+  }
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    r[12u + i] = out[i];
+  }
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    r[16u + i] = s_trace_jitter[i];
+  }
+  r[20] = imu_yaw;
+
+  g_trace_n = row + 1u;
+  if (g_trace_n >= kTraceRows) {
+    g_trace_state = 2u;
+  }
+  for (uint32_t i = 0u; i < kWheelCount; ++i) {
+    s_trace_jitter[i] = 0.0f;
+  }
+}
 }  // namespace
 
 /* Exported function definitions ---------------------------------------------*/
@@ -160,6 +308,29 @@ void Robot::Update(float dt)
     }
     d.w_des = command_.w;
     d.seq = ++comm_seq_;
+  }
+
+  /* ---------- 小陀螺诊断记录：只读本周期最终结果，写 RAM，不参与控制 ---------- */
+  {
+    float tgt[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float vel[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float out[kWheelCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (chassis_ != nullptr) {
+      const hello_world::chassis_ik_solver::WheelVel& wv = chassis_->wheel_vel();
+      for (uint8_t i = 0; i < kWheelCount; ++i) {
+        tgt[i] = wv.v[i];
+      }
+    }
+    for (uint8_t i = 0; i < kWheelCount; ++i) {
+      if (motors_[i] != nullptr) {
+        vel[i] = motors_[i]->vel();
+      }
+      if (wheel_pids_[i] != nullptr) {
+        out[i] = wheel_pids_[i]->out();
+      }
+    }
+    TraceTick(hello_world::tick::GetTickMs(), static_cast<uint8_t>(mode_), command_.w, delta_,
+              tgt, vel, out, (imu_ != nullptr) ? imu_->yaw() : 0.0f);
   }
 }
 
@@ -401,13 +572,40 @@ void Robot::GenerateCommands(float dt)
 
 /**
  * @brief       平移解算用的坐标系角度
- * @retval      0 = 车体系（g_ignore_delta = 1）；否则 = 真实 δ（云台系）
+ * @retval      0 = 车体系；否则 = 真实 δ（云台系）
  * @note        ⚠️ 只用于 SetCommand 的坐标系参数。跟随模式算 w 必须用真实 delta_，
  *              否则 δ 恒为 0、跟随模式失效。
+ *
+ * 2026-11-18：**小陀螺模式用真实 δ，其余模式仍按车体系**。
+ *   为什么小陀螺必须用 δ：底盘在自转，车体系里的"前"每时每刻都在转 —— 操作手推着
+ *   "前"走，车却一边转一边画圈，平移根本没法用。锁到云台系以后，推前 = 沿枪口走，
+ *   枪口指着哪儿车就往哪儿平移，这才是验收项「拨轮控自旋；平移方向仍随枪口」。
+ *   为什么其余模式不用 δ：分离模式底盘不主动转，两种坐标系只在"云台被人为转开"
+ *   时有差别，操作手反馈车体系更直观（2026-11-17 现场结论）；跟随模式底盘本来就在
+ *   往枪口对齐，δ→0，两者差别可以忽略。
+ *   要强制所有模式都按车体系（例如单独验方向），把 g_ignore_delta 写 1。
+ *   云台板离线时 delta_ 在 UpdateInputs() 里被置 0，会自动退回车体系。
  */
 float Robot::kFrameDelta(void) const
 {
-  return (g_ignore_delta == 1u) ? 0.0f : delta_;
+  if (g_ignore_delta == 1u) {
+    return 0.0f;
+  }
+  if (mode_ != ChassisMode::kSpin) {
+    return 0.0f;
+  }
+  /* 角速度超前补偿：见 g_frame_lead 的说明。
+   * δ_eff = δ − lead·ω。限到 ±0.6 rad（34°），防止 IMU 异常时把平移拧飞。 */
+  if (imu_ == nullptr) {
+    return delta_;
+  }
+  float lead = g_frame_lead * imu_->yawRate();
+  if (lead > 0.6f) {
+    lead = 0.6f;
+  } else if (lead < -0.6f) {
+    lead = -0.6f;
+  }
+  return WrapToPi(delta_ - lead);
 }
 
 void Robot::OutputWheels(float dt)

@@ -28,7 +28,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('uid', 'alive', 'dump-dbus', 'flash', 'bench')]
+    [ValidateSet('uid', 'alive', 'dump-dbus', 'dump-trace', 'flash', 'bench')]
     [string]$Action = 'uid',
 
     [ValidateSet('chassis', 'gimbal')]
@@ -36,6 +36,10 @@ param(
 
     # 仓库根目录（默认由脚本位置推断：tools\ 的上一级）
     [string]$Repo = '',
+
+    # J-Link 速度，单位 kHz。1 MHz 经常 Failed to initialize DAP；
+    # 这块板 200 kHz 通常能通（见 docs/bringup.md 4.1 与交接文档"常用坑"）。
+    [int]$Speed = 1000,
 
     # dump-dbus 的输出文件；空则写到当前目录下的 dbus_cap.bin
     [string]$OutFile = '',
@@ -61,7 +65,9 @@ if ([string]::IsNullOrWhiteSpace($Repo)) {
     $Repo = Split-Path -Parent $PSScriptRoot
 }
 if ([string]::IsNullOrWhiteSpace($OutFile)) {
-    $OutFile = Join-Path (Get-Location) 'dbus_cap.bin'
+    # dump-trace 默认写 spin_trace.bin，别把自旋数据盖到 DBUS 抓包文件名上
+    $leaf = if ($Action -eq 'dump-trace') { 'spin_trace.bin' } else { 'dbus_cap.bin' }
+    $OutFile = Join-Path (Get-Location) $leaf
 }
 
 $JLink = 'C:\Program Files\SEGGER\JLink_V978\JLink.exe'
@@ -106,7 +112,8 @@ function Invoke-JLink([string[]]$lines, [string]$tag = 'cmd') {
     $f = Join-Path $env:TEMP ("jlink_{0}_{1}.jlink" -f $tag, [guid]::NewGuid().ToString('N').Substring(0, 6))
     Set-Content -Path $f -Encoding ASCII -Value $lines
     Write-Verbose ("JLink script ({0}):`n{1}" -f $f, ($lines -join "`n"))
-    $out = & $JLink -device STM32F407IG -if SWD -speed 1000 -autoconnect 1 `
+    # 速度只在命令行给一次：各 Action 的脚本里不再写 'speed'，否则会盖掉 -Speed 200
+    $out = & $JLink -device STM32F407IG -if SWD -speed $Speed -autoconnect 1 `
         -ExitOnError 1 -CommanderScript $f 2>&1 | Out-String
     Remove-Item $f -ErrorAction SilentlyContinue
     return $out
@@ -122,7 +129,7 @@ function Get-WordLine([string]$text, [string]$addrPrefix) {
 # ---------------------------------------------------------------- uid
 function Do-Uid([switch]$Quiet) {
     $out = Invoke-JLink @(
-        'si SWD', 'speed 1000', 'connect',
+        'si SWD', 'connect',
         'mem32 0x1FFF7A10 3',
         'mem32 0x08000000 2',
         'q'
@@ -157,7 +164,7 @@ function Do-Alive() {
 
     function Read-Tick {
         $out = Invoke-JLink @(
-            'si SWD', 'speed 1000', 'connect',
+            'si SWD', 'connect',
             $FreezeIwdg,
             ('mem32 {0} 1' -f $tickAddr),
             'g',
@@ -193,7 +200,7 @@ function Do-DumpDbus() {
     # 先把已有的文件删掉：J-Link 不会覆盖已存在文件时会静默保留旧内容
     Remove-Item $OutFile -ErrorAction SilentlyContinue
     $out = Invoke-JLink @(
-        'si SWD', 'speed 1000', 'connect',
+        'si SWD', 'connect',
         $FreezeIwdg,
         ('savebin "{0}", {1}, 0x{2:X}' -f $OutFile, $addr, $size),
         'r', 'g', 'q'
@@ -239,7 +246,7 @@ function Do-Flash() {
     #    仍然计数（底盘 300 ms）。中途复位会让 flash 写一半 —— 轻则校验失败，重则开不了机。
     #    DBGMCU 属于调试域，写一次管到下次掉电。
     $out = Invoke-JLink @(
-        'si SWD', 'speed 1000', 'connect',
+        'si SWD', 'connect',
         $FreezeIwdg,
         ('loadfile "{0}"' -f $Elf),
         'r',
@@ -268,6 +275,97 @@ function Do-Flash() {
     }
 }
 
+# ---------------------------------------------------------------- dump-trace
+# 导出「小陀螺自旋诊断」录制区（Chassis/RobotModules/component/robot.cpp 里的 g_trace_*）。
+# 数据是固件在 1 kHz 控制周期里按 100 Hz 自己记的，跑的时候 SWD 可以拔掉；
+# 停下来再接上导出即可（connect 会 halt CPU，这里先冻结 IWDG 再 savebin）。
+#
+# 为什么要录而不是"边跑边读"：J-Link 的 connect 会 halt CPU，读到的都是冻结值，
+# 单个快照看不出"逐渐变慢"这个过程；而且车在转的时候挂着 SWD 排线容易被绞。
+function Get-SymbolSize([string]$name) {
+    if (-not $Nm) { throw '找不到 arm-none-eabi-nm，无法查符号大小' }
+    $pattern = [regex]::Escape($name) + '$'
+    $line = & $Nm -C -S $Elf | Where-Object { $_ -match $pattern } | Select-Object -First 1
+    if (-not $line) { return $null }
+    $parts = $line -split '\s+'
+    return ('0x' + $parts[1])
+}
+
+function Do-DumpTrace() {
+    $addrBuf   = Get-SymbolAddress 'g_trace_buf'
+    $addrN     = Get-SymbolAddress 'g_trace_n'
+    $addrState = Get-SymbolAddress 'g_trace_state'
+    $addrT0    = Get-SymbolAddress 'g_trace_t0_ms'
+    $addrMode  = Get-SymbolAddress 'g_trace_mode'
+
+    # 700 行 × 21 列 × 4 字节 = 58800 = 0xE5B0；从 nm -S 现取，改代码后不会对不上
+    $sizeHex = Get-SymbolSize 'g_trace_buf'
+    if (-not $sizeHex) { throw '取不到 g_trace_buf 的大小（固件里没有这个符号？先烧带 trace 的版本）' }
+    Write-Host ("g_trace_buf @ {0}，大小 {1}" -f $addrBuf, $sizeHex)
+
+    Remove-Item $OutFile -ErrorAction SilentlyContinue
+    $out = Invoke-JLink @(
+        'si SWD', 'connect',
+        $FreezeIwdg,
+        ('savebin "{0}", {1}, {2}' -f $OutFile, $addrBuf, $sizeHex),
+        ('mem32 {0} 1' -f $addrN),
+        ('mem32 {0} 1' -f $addrState),
+        ('mem32 {0} 1' -f $addrT0),
+        ('mem32 {0} 1' -f $addrMode),
+        'g', 'q'
+    ) 'trace'
+
+    if (-not (Test-Path $OutFile)) {
+        Write-Host $out
+        throw "savebin 没有生成文件：$OutFile"
+    }
+
+    # mem32 输出形如 "20001A2C = 000002BC"，按地址前缀取行、取 '=' 右边的第一个字
+    function Read-WordAt([string]$addr) {
+        $prefix = $addr.Substring(2).ToUpper()
+        $line = Get-WordLine $out $prefix
+        if (-not $line) { return $null }
+        return [Convert]::ToUInt32((($line -split '=')[1].Trim() -split '\s+')[0], 16)
+    }
+    $n     = Read-WordAt $addrN
+    $state = Read-WordAt $addrState
+    $t0    = Read-WordAt $addrT0
+    $mode  = Read-WordAt $addrMode
+    if (($null -eq $n) -or ($null -eq $state)) {
+        Write-Host $out
+        throw '读 g_trace_n / g_trace_state 失败'
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($OutFile)
+    Write-Host ("导出       : {0}（{1} 字节）" -f $OutFile, $bytes.Length)
+    $stateName = @{ 0 = '待触发（还没进小陀螺/拨轮没推）'; 1 = '录制中（没录满就断电了）'; 2 = '录满（正常）' }
+    $s = if ($stateName.ContainsKey([int]$state)) { $stateName[[int]$state] } else { '未知' }
+    Write-Host ("录制状态   : state={0} {1}" -f $state, $s)
+    Write-Host ("样本数     : {0} / 700（100 Hz，最长 7.0 s）" -f $n)
+    Write-Host ("触发模式   : {0}（2=小陀螺）" -f $mode)
+    if ($n -eq 0) {
+        Write-Host '判读       : 一条都没录到 —— 没进小陀螺，或拨轮没推到 |w|>0.2 rad/s'
+        return
+    }
+
+    # 顺手把状态清零，下一次拨轮就能重新录一遍（不用重新上电）
+    $null = Invoke-JLink @(
+        'si SWD', 'connect', $FreezeIwdg,
+        ('w4 {0} 00000000' -f $addrState),
+        ('w4 {0} 00000000' -f $addrN),
+        'g', 'q'
+    ) 'tracereset'
+
+    $sidecar = [ordered]@{
+        n = [int]$n; state = [int]$state; t0_ms = [int]$t0; mode = [int]$mode
+        rows = 700; cols = 21; row_bytes = 84; file = (Split-Path -Leaf $OutFile)
+    }
+    $jsonPath = [System.IO.Path]::ChangeExtension($OutFile, 'json')
+    ($sidecar | ConvertTo-Json) | Set-Content -Path $jsonPath -Encoding utf8
+    Write-Host ("侧车文件   : {0}" -f $jsonPath)
+    Write-Host '下一步     : python tools\spin_trace.py --dump spin_trace.bin'
+}
+
 # ---------------------------------------------------------------- bench
 # 台架/开环测试：绕 PID 直接给四轮同一个电流，车必须架空！
 # 为什么要走脚本：duty 是 float，J-Link 的 w4 只收 IEEE-754 位模式，手算容易错。
@@ -278,7 +376,7 @@ function Do-Bench() {
     if ($BenchOff -or ($Duty -eq 0)) {
         Write-Host '关台架模式：g_bench_enable = 0，g_bench_open_duty = 0'
         $out = Invoke-JLink @(
-            'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+            'si SWD', 'connect', $FreezeIwdg,
             ('w4 {0} 00000000' -f $addrEnable),
             ('w4 {0} 00000000' -f $addrDuty),
             'g', 'q'
@@ -290,7 +388,7 @@ function Do-Bench() {
         $bits = '{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([float]$Duty), 0)
         Write-Host ("开台架模式 + 开环 duty={0}（{1}）" -f $Duty, $bits)
         $out = Invoke-JLink @(
-            'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+            'si SWD', 'connect', $FreezeIwdg,
             ('w4 {0} 5A5A5A5A' -f $addrEnable),
             ('w4 {0} {1}' -f $addrDuty, $bits),
             'g', 'q'
@@ -299,7 +397,7 @@ function Do-Bench() {
 
     Start-Sleep -Milliseconds 400
     $chk = Invoke-JLink @(
-        'si SWD', 'speed 1000', 'connect', $FreezeIwdg,
+        'si SWD', 'connect', $FreezeIwdg,
         ('mem32 {0} 2' -f $addrDuty),   # duty 和 enable 在内存里相邻：先 duty 后 enable
         'q'
     ) 'benchchk'
@@ -314,6 +412,7 @@ switch ($Action) {
     'uid'       { $null = Do-Uid }
     'alive'     { $null = Do-Alive }
     'dump-dbus' { Do-DumpDbus }
+    'dump-trace' { Do-DumpTrace }
     'flash'     { Do-Flash }
     'bench'     { Do-Bench }
 }
