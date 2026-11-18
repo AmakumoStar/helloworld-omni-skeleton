@@ -100,7 +100,10 @@ class Imu
     }
 
     /* yaw 角速度低通（2026-11-18 新增）：给云台 yaw 环的 D 项用。
-     * 与 euler_[2] 同符号约定（逆时针为正）；只压噪声，不参与姿态解算。
+     * ⚠️ 这里存的是**陀螺 z 原始方向**的低通值，它与 euler_[2]（yaw）**反号**。
+     *   2026-11-18 用「写目标台阶 + 400 拍采样」实测（−0.157 rad 台阶）：
+     *   yaw 下降的整段里 gyro_z 为正，17 个运动采样点 **17/17 全部异号**。
+     *   对外请用下面的 yawRate()（已取负、与 euler 同号），不要直接读 gyro_z_。
      * 为什么不用 euler 差分：那等于把噪声再微分一次，实测"kp 越大振得越厉害"。 */
     gyro_z_ += (gyro_corrected[2] - gyro_z_) * kGyroZFilterAlpha;
 
@@ -120,12 +123,17 @@ class Imu
   float yaw(void) const { return euler_[2]; }
 
   /**
-   * @brief       yaw 角速度（rad/s，已低通），与 euler_[2] 同符号
-   * @note        给云台 yaw 环的 **D 项**用：用它做阻尼不会把 IMU 噪声放大，
-   *              而 `kd·(err−prev_err)/dt` 会（实测 kp 越大振得越厉害）。
+   * @brief       yaw 角速度（rad/s，已低通），**与 euler_[2] 同符号**
+   * @note        给云台 yaw 环的 **D 项**用：喂给 `Pid::UpdateWithRate()` 后
+   *              D 项 = −kd·yawRate = −kd·d(yaw)/dt，才是真阻尼。
+   *              用它做 D 不会把 IMU 噪声放大，而 `kd·(err−prev_err)/dt` 会
+   *              （实测 kp 越大振得越厉害）。
    *              不要拿它替代 euler_[2] 做姿态，它只是给阻尼用的平滑值。
+   * @warning     陀螺 z 与 euler yaw 反号是**实测结论**（2026-11-18 台阶试验）。
+   *              改这里等于改 D 项符号：改完必须先静置 1.5 s（yaw 变化 <0.5°）
+   *              再手推，历史上有过"改完上电自转"的事故。
    */
-  float yawRate(void) const { return gyro_z_; }
+  float yawRate(void) const { return -gyro_z_; }
 
   /** 一次取回 [roll pitch yaw]，单位 rad */
   void getEulerAngle(float euler[3]) const

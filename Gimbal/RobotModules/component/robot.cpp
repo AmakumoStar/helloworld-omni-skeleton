@@ -194,7 +194,7 @@ void Robot::GenerateCommands(float dt)
   {
     hello_world::pid::Pid::Config cfg = gimbal_->yaw_pid().config();
     cfg.kp = hello_world::tune::g_yaw_kp;
-    cfg.ki = hello_world::tune::g_yaw_ki;   /* 红线：必须 0 */
+    cfg.ki = hello_world::tune::g_yaw_ki;   /* 0.02（2026-11-18 批准，原红线为 0） */
     cfg.kd = hello_world::tune::g_yaw_kd;
     gimbal_->yaw_pid().set_config(cfg);
   }
