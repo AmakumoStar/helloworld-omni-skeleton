@@ -82,6 +82,20 @@ class Pid
    */
   float UpdateErr(float error, float dt);
 
+  /**
+   * @brief       用「外部实测速率」做 D 项（2026-11-18 新增）
+   * @param       error: 本周期误差
+   * @param       rate:  实测速率（rad/s），应当是**已低通过滤波**的值
+   * @param       dt:    本周期时长，单位 s
+   * @retval      限幅后的输出
+   * @note        微分为 d = −kd·rate，**不对误差做差分**。
+   *              为什么要这个：对误差差分等于把传感器的噪声再微分一次 ——
+   *              云台 yaw 用 IMU 绝对角闭环，IMU 有 ~9 Hz 纹波，用 UpdateErr 时
+   *              "kp 越大振得越厉害"，因为 D 把纹波放大成了转矩。
+   *              改喂 `imu_->yawRate()`（10 ms 低通）既能给足阻尼、又不会放大噪声。
+   */
+  float UpdateWithRate(float error, float rate, float dt);
+
   /* 数据获取 */
   float out(void) const { return out_; }
   float integral(void) const { return integral_; }

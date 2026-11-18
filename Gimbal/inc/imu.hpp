@@ -34,6 +34,8 @@ namespace imu
 
 /** 姿态解算采样频率，必须与调用 Update() 的频率一致 */
 inline constexpr float kImuSampleFreqHz = 1000.0f;
+/** yaw 角速度的低通系数（1 kHz 下 α=0.1 ≈ 10 ms 时间常数），给 yaw 环 D 项用 */
+inline constexpr float kGyroZFilterAlpha = 0.1f;
 /** Mahony 比例增益（与 C_project 样例一致：kp = 0.5, ki = 0） */
 inline constexpr float kMahonyKp = 0.5f;
 /** Mahony 积分增益 */
@@ -67,6 +69,7 @@ class Imu
     for (uint8_t i = 0; i < 3u; ++i) {
       euler_[i] = 0.0f;
     }
+    gyro_z_ = 0.0f;
   }
 
   /**
@@ -96,6 +99,11 @@ class Imu
       }
     }
 
+    /* yaw 角速度低通（2026-11-18 新增）：给云台 yaw 环的 D 项用。
+     * 与 euler_[2] 同符号约定（逆时针为正）；只压噪声，不参与姿态解算。
+     * 为什么不用 euler 差分：那等于把噪声再微分一次，实测"kp 越大振得越厉害"。 */
+    gyro_z_ += (gyro_corrected[2] - gyro_z_) * kGyroZFilterAlpha;
+
     ahrs_.update(acc, gyro_corrected);
     ahrs_.getEulerAngle(euler_);
   }
@@ -110,6 +118,14 @@ class Imu
   float roll(void) const { return euler_[0]; }
   float pitch(void) const { return euler_[1]; }
   float yaw(void) const { return euler_[2]; }
+
+  /**
+   * @brief       yaw 角速度（rad/s，已低通），与 euler_[2] 同符号
+   * @note        给云台 yaw 环的 **D 项**用：用它做阻尼不会把 IMU 噪声放大，
+   *              而 `kd·(err−prev_err)/dt` 会（实测 kp 越大振得越厉害）。
+   *              不要拿它替代 euler_[2] 做姿态，它只是给阻尼用的平滑值。
+   */
+  float yawRate(void) const { return gyro_z_; }
 
   /** 一次取回 [roll pitch yaw]，单位 rad */
   void getEulerAngle(float euler[3]) const
@@ -130,6 +146,7 @@ class Imu
   ahrs::Mahony ahrs_;         ///< Mahony 姿态解算
   GyroBiasEstimator bias_;    ///< 开机零漂估计
   float euler_[3] = {0.0f, 0.0f, 0.0f};  ///< [roll pitch yaw]，rad
+  float gyro_z_ = 0.0f;                   ///< yaw 角速度（低通后），rad/s，给 yaw 环 D 项用
 };
 
 /* Exported variables --------------------------------------------------------*/

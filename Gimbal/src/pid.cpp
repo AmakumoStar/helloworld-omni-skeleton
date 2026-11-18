@@ -120,6 +120,20 @@ float Pid::UpdateErr(float error, float dt)
   return Step(error, d_term, dt);
 }
 
+float Pid::UpdateWithRate(float error, float rate, float dt)
+{
+  if (dt <= 0.0f) {
+    return out_;
+  }
+
+  /* D 项直接由外部给的（已滤波）速率构成，**不对误差做差分**，避免把噪声放大。
+   * 符号：速率正 ⇒ 输出负（反向阻尼）。 */
+  prev_error_ = error;
+  first_ = false;
+
+  return Step(error, -config_.kd * rate, dt);
+}
+
 /* Private function definitions ----------------------------------------------*/
 }  // namespace pid
 }  // namespace hello_world

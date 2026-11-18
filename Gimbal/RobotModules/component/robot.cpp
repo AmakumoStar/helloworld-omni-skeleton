@@ -251,6 +251,9 @@ void Robot::GenerateCommands(float dt)
     gimbal_->MoveBy(step);
   }
 
+  /* yaw 环的 D 项喂 IMU 的**已低通角速度**（不是误差差分），
+   * 见 Gimbal::Update 的注释：这样能用大 kd 压振而不放大 IMU 的 9 Hz 纹波。 */
+  gimbal_->SetYawRate((imu_ != nullptr) ? imu_->yawRate() : 0.0f);
   gimbal_->Update(dt, yaw_feedback, pitch_feedback);
   target_ = gimbal_->target();
 }

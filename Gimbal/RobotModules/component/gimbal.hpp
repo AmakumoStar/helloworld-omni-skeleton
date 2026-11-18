@@ -89,6 +89,13 @@ class Gimbal
   const GimbalLimits& limits(void) const { return limits_; }
 
   /**
+   * @brief       写入 yaw 的实测角速度（rad/s），供 yaw 环的 D 项使用
+   * @note        每 1 ms 由 Robot 用 `imu_->yawRate()`（已 10 ms 低通）调用。
+   *              不调用时保持 0，yaw 环退化为纯 P，安全。
+   */
+  void SetYawRate(float rate) { yaw_rate_ = rate; }
+
+  /**
    * @brief       写入 MIT 模式增益（仅在改用驱动器内部位置环时使用）
    * @param       kp: 位置环比例，钳到 [0, 500]
    * @param       kd: 速度环比例，钳到 (0, 5]
@@ -213,7 +220,14 @@ class Gimbal
       err_.pitch = 0.0f;
     }
 
-    float yaw_out = yaw_pid_.UpdateErr(err_.yaw, dt);
+    /* ---------- yaw 的 D 项用「IMU 角速度」而不是「误差差分」（2026-11-18）----------
+     * 旧写法 `yaw_pid_.UpdateErr(err, dt)` 内部做 `kd·(err-prev_err)/dt`，
+     * 等于把 IMU 的 ~9 Hz 噪声**再微分一次**放大 —— 操作手原话"转完之后还在振，
+     * 而且 kp 越大振得越厉害"。底盘分离模式的航向保持用 `imu_->yawRate()`
+     * （10 ms 低通过的角速度）做阻尼就不抖，这里改成同一套。
+     * 好处：可以用较大的 kd 去压振，而不用担心把噪声放大。
+     * ⚠️ 没设过 yawRate 时（如台架模式）为 0，退化为纯 P，安全。 */
+    float yaw_out = yaw_pid_.UpdateWithRate(err_.yaw, yaw_rate_, dt);
     float pitch_out = pitch_pid_.UpdateErr(err_.pitch, dt);
 
     output_.yaw = Clamp(yaw_out, -limits_.max_torque, limits_.max_torque);
@@ -244,6 +258,7 @@ class Gimbal
   GimbalPos output_{};                    ///< 转矩输出
   float mit_kp_ = 0.0f;                   ///< MIT 内部位置环 kp（默认走外置 PID）
   float mit_kd_ = 0.0f;                   ///< MIT 内部位置环 kd
+  float yaw_rate_ = 0.0f;                 ///< yaw 实测角速度（IMU，已低通），给 D 项用
   hello_world::pid::Pid yaw_pid_{};       ///< yaw 位置环
   hello_world::pid::Pid pitch_pid_{};     ///< pitch 位置环
 

@@ -189,9 +189,14 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
  *     硬一点：3.0 / 0.15      再硬：3.0 / 0.20
  *     发振/啸叫：2.0 / 0.15，再不行 1.5 / 0.12（回到原值）
  *   判据：手推 yaw 松手后**一次收敛**、不来回摆、无高频抖；推的过程明显"顶手"。 */
-volatile float hello_world::tune::g_yaw_kp = 2.5f;
+volatile float hello_world::tune::g_yaw_kp = 3.5f;
 volatile float hello_world::tune::g_yaw_ki = 0.0f;
-volatile float hello_world::tune::g_yaw_kd = 0.15f;
+/* kd 单位 = N·m per (rad/s)，D 项由 **IMU 的已滤波角速度** 构成（不再是误差差分）。
+ * ⚠️ 2026-11-18 实测：kd=0.30 会自激（幅度越振越大）。
+ *    原因：`yawRate()` 带 10 ms 一阶低通，**相位滞后在高频段会把 D 从阻尼翻成正反馈**。
+ *    所以 kd 不能因为"信号干净"就放大——滤波的滞后是硬约束。
+ *    0.03 ≈ 刚好进入阻尼区；还振就退到 0（纯 P，靠 kp 拿刚度）。 */
+volatile float hello_world::tune::g_yaw_kd = 0.03f;
 
 /* pitch 位置环：实车"手拨不够硬"，2026-11-17 由 5.0/0.12 提到 10.0/0.25。
  * ki 仍然为 0（防飞转红线，别加）。 */
