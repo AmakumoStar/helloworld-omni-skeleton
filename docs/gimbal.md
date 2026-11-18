@@ -147,12 +147,14 @@ if (local_rc_online) {
 
 | 参数 | 当前值 | 位置 | 状态 |
 |---|---|---|---|
-| `max_yaw_rate` | 6.0 rad/s | `main_task.cpp` | 手感值 |
-| `max_pitch_rate` | 3.0 rad/s | 同上 | 手感值 |
-| `max_torque` | **1.0 N·m**（调试） | 同上 | 验收改 3.0；电机上限 7.5 |
-| `pitch_min/max` | −0.35 / +0.60 | 同上 | **待实测** |
-| yaw 环 `kp/ki/kd` | **2.0 / 0 / 0.35** | `pid_tune.hpp`（可在线改） | 未整定 |
-| pitch 环 `kp/kd` | 5.0 / 0.12 | `main_task.cpp` | **完全未验证** |
+| `max_yaw_rate` | **2.0 rad/s** | `main_task.cpp` | 实车手感 |
+| `max_pitch_rate` | **1.0 rad/s** | 同上 | 实车手感 |
+| `max_torque`（yaw） | **1.0 N·m** | 同上 | **红线，不改** |
+| `max_torque_pitch` | **2.0 N·m** | 同上 | 重力轴，操作手批准的放宽 |
+| `pitch_min/max` | **−0.008 / +0.583 rad** | 同上 | 机械 −0.111/+0.687，两端余量 6° |
+| yaw 环 `kp/ki/kd` | **3.5 / 0.02 / 0.35** | `main_task.cpp`（`g_yaw_*`，可在线改） | 已整定：0.5 rad 斜坡超调 0.8° |
+| pitch 环 `kp/kd` | **10.0 / 0.25** | 同上 | 已整定；ki 固定 0 |
+| 重力前馈 `g_pitch_grav_ff` | **0.60 N·m** | 同上 | 实测 G=0.60 |
 | 摇杆死区 | 0.05 | `module_state.hpp` | 实测遥控器有 −0.055 偏置，可能需要中位标定 |
 | 反馈超时 | 50 ms | `module_state.hpp` | 超时即判离线、输出归零 |
 | 姿态解算 | Mahony kp=0.5 / ki=0 | `imu.hpp` | 与参考工程一致 |
@@ -187,10 +189,11 @@ yaw 的三个增益放在 `volatile float` 全局里，每 1 ms 写进 PID：
 
 | 问题 | 现象 | 状态 |
 |---|---|---|
-| **pitch 无反馈** | `angle=0`、温度 `0/0`，但 `is_enabled=1` | 两台车都一样。CAN 上出现过 `0x001`/`0x002`，怀疑 pitch 的 Master ID 不是 `0x11` |
-| 绝对角漂移 | 长时间运行枪口缓慢偏移 | Mahony 无磁力计，已知限制 |
+| **pitch 无反馈** | `angle=0`、温度 `0/0` | ✅ 已修：CAN 滤波器/中断 bug，不是硬件（known_issues §3） |
+| 绝对角漂移 | 长时间运行枪口缓慢偏移 | Mahony 无磁力计，已知限制（度/分钟级） |
 | 关节角 vs 绝对角混用 | 内部目标是绝对角，对外报关节角 | 有意设计，但容易读错 |
-| pitch 环未验证 | `kp=5.0/kd=0.12` 从未跑过 | 等 pitch 通 |
+| 大角度超调的硬下限 | 0.5 rad 斜坡仍有 ~0.8° 超调 | 1 N·m 限幅决定，kp/kd 再调无效；见 known_issues §14 |
+| 陀螺 z 与 euler yaw 反号 | D 项曾因此变成正反馈（越加 D 越振） | ✅ 已修：`yawRate()` 取负（known_issues §13） |
 
 ---
 

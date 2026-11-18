@@ -223,7 +223,7 @@ Set-Content $f -Encoding ASCII -Value @('si SWD','speed 1000','connect','mem32 0
 |---|---|---|
 | 分离 | Up | 各方向平移/转向符合直觉，松手立刻停 |
 | 跟随 | Mid | **转云台 90°，车头自动追过去并停住**（不是一直转） |
-| 小陀螺 | Down | 拨轮控自旋；**平移方向仍随枪口**（核心验收点）——`g_ignore_delta` 必须为 0、`kFrameDelta()` 小陀螺用真实 δ；自旋时方向偏 15° 用 `g_frame_lead` 补偿（见 `handoff_2026-11-17.md` 第四节） |
+| 小陀螺 | Down | 拨轮控自旋；**平移方向仍随枪口**（核心验收点）——`g_ignore_delta` 必须为 0、`kFrameDelta()` 小陀螺用真实 δ；自旋时方向偏用 `g_frame_lead` 补偿（见 [known_issues.md](known_issues.md) §7） |
 
 ⚠️ 跟随/小陀螺成立的前提是**云台绝对指稳**（见 [architecture.md](architecture.md) 设计决策 1）。
 
