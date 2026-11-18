@@ -24,6 +24,22 @@ extern volatile float g_yaw_kd;  ///< yaw 位置环微分（对误差微分）
 extern volatile float g_pitch_kp;  ///< pitch 位置环比例
 extern volatile float g_pitch_kd;  ///< pitch 位置环微分（对误差微分）
 
+/**
+ * pitch **重力前馈**（N·m，正 = 抬头方向）。
+ *
+ * 为什么需要它（2026-11-18 实测现象：手向下拨的恢复力明显弱于向上拨）：
+ *   `ki` 被红线锁死为 0，顶住俯仰重力只能靠 P 项 ⇒ 稳态必然下垂 err = G/kp，
+ *   于是电机的可用转矩量程是「向下 1−G / 向上 1+G」，两边不对称（G≈0.4 时差 2.3 倍）。
+ *   把 G 作为常量前馈补上，PID 就回到 0 附近工作，上下手感对称、下垂消失，
+ *   而且**不需要 ki**，不动红线。
+ *
+ * 怎么定这个数：稳态时 `output().pitch ≈ G`（ki=0 时 PID 输出就等于顶住重力的转矩），
+ *   J-Link 读 `Gimbal::output().pitch` 的稳定值即为 G，填到这里。
+ * ⚠️ 调大好 → 云台会稳定地"偏高" G_err/kp 度；调小 → 仍下垂。以 ±0.05 为步进。
+ * ⚠️ 只在闭环"跟目标"时生效；目标被限位钳住、err 被清零时自动跳过（避免顶机械限位）。
+ */
+extern volatile float g_pitch_grav_ff;
+
 }  // namespace tune
 }  // namespace hello_world
 

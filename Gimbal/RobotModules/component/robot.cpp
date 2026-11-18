@@ -102,19 +102,23 @@ void Robot::Reset(void)
 void Robot::UpdateInputs(void)
 {
   bool estop_switch = false;
-  if (rc_ != nullptr) {
-    /* 与底盘板保持一致：左上小拨杆**上推** = 急停（2026-11-17 晚改）。
-     * ⚠️ 本板上这条目前是**死代码**：接收机接在底盘板上，local_rc_online 恒为 false，
-     *    本板实际靠底盘转发的 peer-estop 位（comm_->chassis_data().estop）判急停。
-     *    这里同步只是为了让两块板的"急停语义"一致，免得以后把接收机挪过来时行为不同。
-     *    真正生效要等云台板能重新烧录。 */
+  const bool local_rc_online = (rc_ != nullptr) && (!rc_checker_.isOffline());
+  if (local_rc_online) {
+    /* 与底盘板保持一致：左上小拨杆**上推** = 急停。
+     *
+     * ⚠️⚠️ 必须先判 local_rc_online 再读拨杆！2026-11-18 踩过：
+     *   接收机接在**底盘板**上，本板一帧 DBUS 都收不到，于是 `rc_->rc_l_switch()`
+     *   永远返回 DT7 的**类默认值 kSwitchStateUp**（DT7.hpp:187）。而"上"正好是
+     *   新定义的急停位 ⇒ 云台以为自己一直在急停 ⇒ 永远 Dead、输出恒零，
+     *   表现就是"云台又软又不回位、右摇杆没反应"，还连带整块板不发有效状态。
+     *   改成"只有本地真的收到 DBUS 帧才信本地拨杆"之后，本板平时靠底盘转发的
+     *   peer-estop 位判急停（见下面），把接收机挪过来时这条会自动接管。 */
     estop_switch =
         (rc_->rc_l_switch() == hello_world::remote_control::kSwitchStateUp);
   }
   estop_ = estop_switch;
 
   const bool imu_ready = (imu_ != nullptr) && imu_->isCalibrated();
-  const bool local_rc_online = (rc_ != nullptr) && (!rc_checker_.isOffline());
   const bool peer_online = (comm_ != nullptr) && (!comm_->isOffline());
   /* 遥控接收机接在底盘板上：只要底盘在线，摇杆值就会经双板帧转发过来，
    * 等效于本板也有控制源（底盘自己已经用它的 rc_online 把关）。 */
@@ -271,9 +275,28 @@ void Robot::OutputMotors(void)
                                       gimbal_->mit_kp(), gimbal_->mit_kd(), torque);
   }
   if (pitch_motor_ != nullptr) {
-    const float torque = pitch_motor_->IsFeedbackFresh(now_ms, kMotorFeedbackTimeoutMs)
-                             ? gimbal_->output().pitch
-                             : 0.0f;
+    float torque = 0.0f;
+    if (pitch_motor_->IsFeedbackFresh(now_ms, kMotorFeedbackTimeoutMs)) {
+      torque = gimbal_->output().pitch;
+
+      /* ---------- 重力前馈（2026-11-18）----------
+       * 现象：手向下拨 pitch 的恢复力明显弱于向上拨。
+       * 原因：ki 被红线锁死为 0，顶住俯仰重力只能靠 P 项 ⇒ 稳态下垂 err=G/kp，
+       *   电机可用量程变成「向下 1−G / 向上 1+G」，两边不对称（G≈0.4 时差 2.3 倍）。
+       * 这里把 G 作为常量前馈补上，PID 回到 0 附近工作，上下对称、下垂消失，
+       *   而且**不需要 ki**，不动红线。
+       * ⚠️ 只在闭环真正"跟目标"时加：目标被限位钳住、误差被清零时（顶在机械限位上）
+       *    必须跳过，否则会变成持续顶着限位磨。判据与 Gimbal::Update 里的限位保护一致。 */
+      const GimbalLimits& lim = gimbal_->limits();
+      const float fb = pitch_motor_->angle();
+      const float err_pitch = gimbal_->error().pitch;
+      const bool at_limit = ((fb >= lim.pitch_max) && (err_pitch > 0.0f)) ||
+                            ((fb <= lim.pitch_min) && (err_pitch < 0.0f));
+      if (!at_limit) {
+        torque = Clamp(torque + hello_world::tune::g_pitch_grav_ff, -lim.max_torque_pitch,
+                       lim.max_torque_pitch);
+      }
+    }
     AsDaMiao(pitch_motor_)->setMitInput(pitch_motor_->angle(), 0.0f,
                                         gimbal_->mit_kp(), gimbal_->mit_kd(), torque);
   }

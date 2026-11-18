@@ -46,7 +46,16 @@ struct GimbalLimits {
   float pitch_max = 0.60f;       ///< pitch 软件上限，rad
   float max_yaw_rate = 6.0f;     ///< 摇杆最大 yaw 角速度，rad/s
   float max_pitch_rate = 3.0f;   ///< 摇杆最大 pitch 角速度，rad/s
-  float max_torque = 3.0f;       ///< 位置环输出转矩上限，N·m（留余量，避免打满）
+  /* ===== 两轴转矩上限**分开**（2026-11-18）=====
+   * max_torque 管 **yaw**（保持 1.0 N·m，历史红线：11-16 的飞转发生在 yaw 自由轴）；
+   * max_torque_pitch 管 **pitch**（2.0 N·m）。
+   * 为什么 pitch 要更大：pitch 是**重力轴**，静止就要拿 ~0.6 N·m 顶住（占用 1.0 上限的 60%），
+   *   于是"向下拨"只剩 0.4 N·m 余量、"向上拨"有 1.6 N·m —— 手感差 4 倍。
+   *   提到 2.0 后变成 1.4 vs 2.6（差 1.86 倍），同时饱和点 5.7° → 11.5°，整体更硬。
+   * ⚠️ 两个上限都必须 ≥ 各自的重力/扰动所需，否则又会退回"向下软"。
+   * ⚠️ 改这个值等于放宽安全边界：改完必须重新做"手推不飞 + 静置 30 s"验证。 */
+  float max_torque = 3.0f;       ///< **yaw** 位置环输出转矩上限，N·m
+  float max_torque_pitch = 3.0f; ///< **pitch** 位置环输出转矩上限，N·m
 };
 
 /* Exported functions ------------------------------------------------------- */
@@ -208,7 +217,7 @@ class Gimbal
     float pitch_out = pitch_pid_.UpdateErr(err_.pitch, dt);
 
     output_.yaw = Clamp(yaw_out, -limits_.max_torque, limits_.max_torque);
-    output_.pitch = Clamp(pitch_out, -limits_.max_torque, limits_.max_torque);
+    output_.pitch = Clamp(pitch_out, -limits_.max_torque_pitch, limits_.max_torque_pitch);
   }
 
   /* 数据获取 */
