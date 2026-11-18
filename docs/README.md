@@ -24,6 +24,7 @@ STM32F407IGH6 ×2、C++20、1 ms 控制周期。
 | **[protocol.md](protocol.md)** | 改双板通信、对单位/坐标系有疑问 |
 | **[gimbal.md](gimbal.md)** | 云台环的细节（绝对角、限位、前馈） |
 | **[dbus_capture.md](dbus_capture.md)** | 需要重新抓 DBUS 原始流时 |
+| **[tools.md](tools.md)** | `tools/` 各脚本（jlink.ps1、spin_trace.py、wheel_step.py…）的用途与数据流 |
 | **[history/handoff_2026-11-17.md](history/handoff_2026-11-17.md)** | 历史交接（内容已并入 known_issues，仅存档） |
 
 ---
