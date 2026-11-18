@@ -26,6 +26,8 @@ extern volatile float g_wheel_kp;
 extern volatile float g_wheel_ki;
 extern volatile float g_wheel_kd;
 extern volatile float g_wheel_ff;
+/* 前馈衰减拐点（rad/s）：|vel| 到达它时静摩擦前馈衰减到 0（见 OutputWheels 的注释） */
+extern volatile float g_wheel_ff_knee;
 
 namespace robot
 {
@@ -166,6 +168,19 @@ volatile float g_delta_offset = 1.8900f;
  * 转 90° 的时间从 3.9 s 缩短到约 2 s，且仍不来回摆。 */
 volatile float g_follow_kp = 1.2f;
 volatile float g_follow_kd = 0.20f;
+
+/* ===== 小陀螺模式的平移倍率（运行期可调）=====
+ * 2026-11-17 晚按操作手要求：**小陀螺档平移要更快**。
+ * 自旋时每轮都有一部分轮速被自旋项占掉（0.3068×max_spin_w ≈ 0.46 m/s），
+ * 平移余量本来就少，所以只放大 spin 档；分离/跟随保持已验证的 0.20 m/s 不动。
+ *
+ * 取值：1.0 ~ kSpinTransBoostMax（默认 1.5）。J-Link 写 float 位模式即可，
+ * 复位回默认。⚠️ 调好之后要写回 chassis.hpp 的 kSpinTransBoostMax（它是闸门
+ * static_assert 的输入，运行期这个变量被 Clamp 在它以内，不会破坏断言）。
+ *
+ * 换算（名义值，实车另有 ~1.71 倍比例未定案，见 handoff 第五节）：
+ *   1.5 × 0.20 = 0.30 m/s 名义 → 实车约 0.5 m/s */
+volatile float g_spin_trans_boost = kSpinTransBoostMax;
 
 /* ==================== 小陀螺自旋诊断记录（只写 RAM，不参与控制）====================
  * 为什么要有它：J-Link 的 connect 会把 CPU halt 住，单次 mem32 只能拿到一个**冻结的
@@ -338,13 +353,20 @@ void Robot::Update(float dt)
     ChassisData& d = comm_->chassis_data();
     d.online = true;
     d.ready = (life_state_ == LifeState::kWorking);
-    d.estop = estop_;
+    /* ⚠️ 2026-11-17：遥控离线必须让云台也归零，所以把"离线"并进这一位。
+     * 原因：接收机接在**底盘板**上，云台板的在线判据是 rc_online = local || peer
+     * （见 Gimbal robot.cpp），只要本板还活着它就认为"遥控在线"，于是继续留在
+     * Working 里保持力矩 —— 遥控器断电后云台仍然有力，违反"断遥控必须没力"。
+     * ChassisData::estop 的定义本来就是"底盘侧急停（遥控器急停位 / 遥控离线）"，
+     * 这里补上"遥控离线"这半句；云台侧现成的 peer-estop 逻辑会走 OutputZero。
+     * 注意：只影响**发给云台的那一帧**，不改变本板 estop_ 的语义。 */
+    d.estop = estop_ || (!inputs_.rc_online);
     d.mode = mode_;
     d.gimbal_mode = GimbalMode::kJointSpace;
     /* 遥控接收机实际接在【底盘板】上，云台板收不到 DBUS。
      * 因此把右摇杆的归一化值（-1~1）放进 yaw_des / pitch_des 转发给云台板，
      * 云台侧再乘自己的速率上限。这样在不动接线的前提下，云台也能被操作手控制。 */
-    if (rc_ != nullptr) {
+    if ((rc_ != nullptr) && inputs_.rc_online) {
       /* 同样先过死区，避免中位抖动被转成云台的持续漂移 */
       d.yaw_des = -ApplyStickDeadzone(rc_->rc_rh());   /* 右摇杆横向 → yaw 角速度（归一化） */
       /* 2026-11-17：模式已挪到**右上三挡拨杆**，右摇杆竖直整个让给 pitch。
@@ -353,6 +375,9 @@ void Robot::Update(float dt)
        * 位置环负责"停住"（松手即停在当前位置）。 */
       d.pitch_des = ApplyStickDeadzone(rc_->rc_rv());
     } else {
+      /* 没有接收机，或**遥控离线**：一律给 0。
+       * 旧代码在离线时仍然转发 rc_ 里"最后收到的那一拍摇杆值"，云台会按这个陈旧值
+       * 一直积分目标（断遥控后云台自己慢慢转），比"保持力矩"更危险。 */
       d.yaw_des = 0.0f;
       d.pitch_des = 0.0f;
     }
@@ -416,16 +441,20 @@ void Robot::UpdateInputs(void)
     rc_online = true;
     estop_switch = false;
   } else if (rc_ != nullptr) {
-    /* 急停判定：两条**或**关系，任何一条成立都全零。
-     *   1) 左摇杆拉到底（≤ -0.9；卡住位置是 -1.0，正常后退最多 -0.7，不会误触）
-     *      —— 需求里"急停保留左摇杆到底"就是这一条，不动。
-     *   2) 左拨杆拨到最下（kSwitchStateDown）
-     *      —— 2026-11-17 实测拨杆已进帧（data[5] 会变），这条现在真的生效了。
-     *      保留它作为第二条急停通路，fail-safe；不想要就把这半句删掉。
-     * ⚠️ 两个"左"是不同物件：左**摇杆**（中间那个）和左**拨杆**（左上小拨杆）。 */
-    estop_switch = (rc_->rc_l_switch() ==
-                    hello_world::remote_control::kSwitchStateDown) ||
-                   (rc_->rc_lv() <= -0.9f);
+    /* 急停判定（2026-11-17 晚按操作手要求改）：**左上小拨杆上推 = 急停**，唯一通路。
+     *
+     * 为什么改：左摇杆整根要留给底盘平移 —— 旧写法"左摇杆拉到底(≤-0.9)=急停"把后退
+     * 行程吃掉了，操作手要倒车就得冒着触发急停的风险。
+     *
+     * 旧的两条都撤掉了（左摇杆 ≤ -0.9、左拨杆拨到最下）：
+     *   · 左摇杆到底 —— 与"摇杆控制底盘"冲突，见上；
+     *   · 左拨杆最下 —— 现在最下是"非急停"档，把最上留给急停，拨杆三档都用满：
+     *       上 = 急停（拉一下就跑不掉了，fail-safe 方向朝上，手下滑也不会误触发）
+     *       中 / 下 = 正常运行
+     * ⚠️ 上电时拨杆若停在"上"，车会一直 Dead（看上去像没反应）——这是设计行为。
+     * ⚠️ 开关取值实测：上 = kSwitchStateUp(1) / 中 = Mid(3) / 下 = Down(2)，
+     *    见 docs/known_issues.md 第 6 节。 */
+    estop_switch = (rc_->rc_l_switch() == hello_world::remote_control::kSwitchStateUp);
     /* ---------- 模式选择：**右上三挡拨杆**（2026-11-17 实测拨杆已进帧）----------
      * 映射（与 DT7 定义一致，实测 data[5]）：上=1 → 分离，中=3 → 跟随，下=2 → 小陀螺。
      * 为什么从"右摇杆拨一下切一档"改成拨杆：右摇杆竖直要整个让给云台 pitch，
@@ -606,10 +635,15 @@ void Robot::GenerateCommands(float dt)
       break;
     }
     case ChassisMode::kSpin: {
-      /* 小陀螺：w 由拨轮设定，必须限幅；平移仍以云台朝向为基准 */
+      /* 小陀螺：w 由拨轮设定，必须限幅；平移仍以云台朝向为基准。
+       * 2026-11-17 晚：**平移单独放大**（g_spin_trans_boost，默认 1.5×）。
+       * 只放大 spin —— 分离/跟随维持已验证的 0.20 m/s，不引入新变量。
+       * 上限受 kSpinTransBoostMax 夹住，而闸门 kMaxWheelVelMps 已按它算过
+       * （main_task.cpp 的 static_assert），所以这里放大不会被闸门等比削掉。 */
       const float w_spin = ApplyStickDeadzone(rc_->rc_wheel()) * lim.max_spin_w;
-      command_.vx = vx_cmd;
-      command_.vy = vy_cmd;
+      const float boost = Clamp(g_spin_trans_boost, 1.0f, kSpinTransBoostMax);
+      command_.vx = vx_cmd * boost;
+      command_.vy = vy_cmd * boost;
       command_.w = Clamp(w_spin, -lim.max_spin_w, lim.max_spin_w);
       break;
     }
@@ -758,12 +792,20 @@ void Robot::OutputWheels(float dt)
     float out = wheel_pids_[i]->Update(target_rad_s, motors_[i]->vel(), dt);
 
     /* 静摩擦前馈：低目标速度下纯 PID 给不出克服静摩擦的电流（推满杆轮子纹丝不动）。
-     * 2026-11-17 实测静摩擦门槛 ≈ raw 655~819；这里按目标方向固定补一份，
-     * 稳态电流由积分项负责补齐。目标接近 0 时不补，避免中位抖动被放大。 */
+     * 2026-11-17 实测静摩擦门槛 ≈ raw 655~819；稳态电流由积分项负责补齐。
+     *
+     * ⚠️ 2026-11-18：从"常数"改成**随速度衰减**。
+     *    常数 ff 在轮子动起来之后就是**过量推力**（动摩擦 ≪ 静摩擦）：架空实测
+     *    150/150/ff=700 时超调 **106%**、2 s 后还差 36%，就是操作手说的
+     *    "一开始快然后变慢"。现在 |vel| 达到 g_wheel_ff_knee 时 ff 衰减到 0，
+     *    只保留"破静摩擦"那几十毫秒的助推（knee=1.0 rad/s ≈ 0.078 m/s 轮面速度）。 */
+    const float ff_knee = (g_wheel_ff_knee > 0.1f) ? g_wheel_ff_knee : 0.1f;
+    const float ff_scale = Clamp(1.0f - (fabsf(motors_[i]->vel()) / ff_knee), 0.0f, 1.0f);
+    const float ff_eff = g_wheel_ff * ff_scale;
     if (target_rad_s > kFfTargetEps) {
-      out += g_wheel_ff;
+      out += ff_eff;
     } else if (target_rad_s < -kFfTargetEps) {
-      out -= g_wheel_ff;
+      out -= ff_eff;
     }
     (void)motors_[i]->setInput(out);
   }

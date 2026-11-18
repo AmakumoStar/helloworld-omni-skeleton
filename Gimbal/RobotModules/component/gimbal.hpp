@@ -24,6 +24,7 @@
 #define GIMBAL_ROBOT_MODULES_GIMBAL_HPP_
 
 /* Includes ------------------------------------------------------------------*/
+#include <cmath>
 #include <cstdint>
 
 #include "module_state.hpp"
@@ -117,6 +118,9 @@ class Gimbal
   {
     output_.setZero();
     err_.setZero();
+    /* 状态切换 / 初始化之后目标会被重对齐到当前角度（Robot::Reset），那是**合法**的
+     * 大跳变，所以下一拍只记录基准、不判跳变。见 Update() 的保护策略 ①。 */
+    primed_ = false;
   }
 
   /**
@@ -132,25 +136,64 @@ class Gimbal
    */
   void Update(float dt, float yaw_feedback, float pitch_feedback)
   {
+    /* ========== 保护策略（2026-11-17 改，依据实车实测） ==========
+     * 旧写法：|err| > 34° → 清积分 + 清输出 + 把 err_ 也写成 0。
+     * 实测后果（手拧云台 >34° 后完全没力，回推 30° 力才回来）：
+     *   清输出 → 关节失去**唯一**能让误差回落的手段 → 误差永远 >34° →
+     *   下一拍继续清零 ⇒ 物理自锁，云台从此撒手，只有外力把它推回 34° 内才解。
+     *   而且把 err_ 写成 0 会掩盖真实误差，排查时读到假 0。
+     * 现在改成两条互补的判据，既能防飞车、又不会永久撒手：
+     *   ① 单拍**跳变**检测：目标或反馈在 1 ms 内跳 > kMaxJumpRad（11.5°）。
+     *      物理上不可能（摇杆 2 rad/s ⇒ 0.002 rad/拍；手拧最快也就 ~0.01 rad/拍），
+     *      只有「信号失效」才会出现（目标被外部写入 / IMU 异常 / 反馈跳变）。
+     *      此时把目标重对齐到当前实际角度（离合器），停手，不追假目标。
+     *   ② 误差 > 34° 时**只清积分**（红线原意），不清输出、不改 err_。
+     *      防飞转仍由「ki = 0 + 积分限幅 ±0.15 + 本条清积分」三条守住。 */
+
+    /* ---------- ① 跳变检测（先判信号是否可信，再谈控制） ---------- */
+    if (!primed_) {
+      prev_target_ = target_;
+      prev_yaw_fb_ = yaw_feedback;
+      prev_pitch_fb_ = pitch_feedback;
+      primed_ = true;
+    } else {
+      /* 必须用 AngleDiff 算变化量：yaw 反馈在 ±π 处回绕，直接相减会被当成跳变 */
+      const float d_tgt_y = AngleDiff(target_.yaw, prev_target_.yaw);
+      const float d_fb_y = AngleDiff(yaw_feedback, prev_yaw_fb_);
+      const float d_tgt_p = AngleDiff(target_.pitch, prev_target_.pitch);
+      const float d_fb_p = AngleDiff(pitch_feedback, prev_pitch_fb_);
+
+      prev_target_ = target_;
+      prev_yaw_fb_ = yaw_feedback;
+      prev_pitch_fb_ = pitch_feedback;
+
+      if ((std::fabs(d_tgt_y) > kMaxJumpRad) || (std::fabs(d_fb_y) > kMaxJumpRad) ||
+          (std::fabs(d_tgt_p) > kMaxJumpRad) || (std::fabs(d_fb_p) > kMaxJumpRad)) {
+        /* 离合器：放弃旧目标，把目标钉到当前实际位置，本拍不驱动 */
+        target_.yaw = yaw_feedback;
+        target_.pitch = Clamp(pitch_feedback, limits_.pitch_min, limits_.pitch_max);
+        yaw_pid_.Reset();
+        pitch_pid_.Reset();
+        err_.setZero();
+        output_.setZero();
+        prev_target_ = target_;
+        ++jump_cnt_;
+        return;
+      }
+    }
+
     /* 角度差必须先归一化，这是 yaw 连续旋转的关键 */
     err_.yaw = AngleDiff(target_.yaw, yaw_feedback);
     err_.pitch = AngleDiff(target_.pitch, pitch_feedback);
 
-    /* ---------- 安全阀：误差过大时拒绝驱动 ----------
-     * 正常工作时位置误差应该是「度」级；一旦超过 kMaxTrackErr，说明目标与实际
-     * 严重不符（IMU 漂移/角度回绕/目标被外部写入/反馈异常）。此时如果继续按误差
-     * 输出，就是「越追越远」的飞车。这里直接清零输出并复位 PID，等误差回落再接管。
-     * ⚠️ 这是实机出现过云台失控后加的硬保护，不要删。 */
+    /* ---------- ② 红线：误差过大只清积分 ----------
+     * 只 Reset()（清积分/微分历史），**不清输出、不改 err_** —— 理由见本函数开头。 */
     constexpr float kMaxTrackErr = 0.60f;  /* rad，约 34° */
     if ((err_.yaw > kMaxTrackErr) || (err_.yaw < -kMaxTrackErr)) {
       yaw_pid_.Reset();
-      err_.yaw = 0.0f;
-      output_.yaw = 0.0f;
     }
     if ((err_.pitch > kMaxTrackErr) || (err_.pitch < -kMaxTrackErr)) {
       pitch_pid_.Reset();
-      err_.pitch = 0.0f;
-      output_.pitch = 0.0f;
     }
 
     /* pitch 目标已在 SetTarget 里钳位；反馈越界时不再继续加油门 */
@@ -182,6 +225,9 @@ class Gimbal
     return AngleInRange(target_.pitch, limits_.pitch_min, limits_.pitch_max);
   }
 
+  /** 跳变保护触发次数（只读调试量：写入后不清零，看它涨就说明判过假信号） */
+  uint32_t jump_cnt(void) const { return jump_cnt_; }
+
  private:
   GimbalLimits limits_{};                 ///< 限幅参数
   GimbalPos target_{};                    ///< 目标关节角
@@ -191,6 +237,19 @@ class Gimbal
   float mit_kd_ = 0.0f;                   ///< MIT 内部位置环 kd
   hello_world::pid::Pid yaw_pid_{};       ///< yaw 位置环
   hello_world::pid::Pid pitch_pid_{};     ///< pitch 位置环
+
+  /* ---------- 跳变检测（见 Update() 的保护策略 ①） ----------
+   * 门限 0.20 rad ≈ 11.5°/拍 = 200 rad/s。物理上不可能：
+   *   摇杆积分 2 rad/s ⇒ 0.002 rad/拍；手拧云台最快 ~10 rad/s ⇒ 0.01 rad/拍；
+   *   底盘自旋 1.5 rad/s ⇒ 0.0015 rad/拍。
+   * 真实的信号失效（目标被 J-Link/上位机写错、IMU 异常、反馈跳变）通常是 0.5 rad 以上，
+   * 所以 0.2 既不会误判物理扰动，又能挡住假信号。 */
+  static constexpr float kMaxJumpRad = 0.20f;
+  GimbalPos prev_target_{};    ///< 上一拍目标（跳变检测基准）
+  float prev_yaw_fb_ = 0.0f;   ///< 上一拍 yaw 反馈
+  float prev_pitch_fb_ = 0.0f; ///< 上一拍 pitch 反馈
+  bool primed_ = false;        ///< 是否已有基准；Stop() 里清掉，下一拍只记录不判
+  uint32_t jump_cnt_ = 0u;     ///< 跳变保护触发次数
 };
 
 /* Exported variables --------------------------------------------------------*/

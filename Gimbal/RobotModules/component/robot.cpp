@@ -103,8 +103,13 @@ void Robot::UpdateInputs(void)
 {
   bool estop_switch = false;
   if (rc_ != nullptr) {
+    /* 与底盘板保持一致：左上小拨杆**上推** = 急停（2026-11-17 晚改）。
+     * ⚠️ 本板上这条目前是**死代码**：接收机接在底盘板上，local_rc_online 恒为 false，
+     *    本板实际靠底盘转发的 peer-estop 位（comm_->chassis_data().estop）判急停。
+     *    这里同步只是为了让两块板的"急停语义"一致，免得以后把接收机挪过来时行为不同。
+     *    真正生效要等云台板能重新烧录。 */
     estop_switch =
-        (rc_->rc_l_switch() == hello_world::remote_control::kSwitchStateDown);
+        (rc_->rc_l_switch() == hello_world::remote_control::kSwitchStateUp);
   }
   estop_ = estop_switch;
 

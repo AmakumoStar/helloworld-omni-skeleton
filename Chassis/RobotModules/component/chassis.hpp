@@ -54,6 +54,20 @@ struct ChassisLimits {
   float max_spin_w = 1.50f;  ///< 小陀螺最大自旋角速度，rad/s（验收改回 8.0）
 };
 
+/**
+ * 小陀螺模式的**平移倍率上限**（默认值也取它）。
+ *
+ * 为什么要单独放大 spin 的平移：自旋时每轮都有一部分轮速被"自旋项"占掉
+ * （0.3068×max_spin_w ≈ 0.46 m/s），留给平移的余量本来就少；操作手反馈
+ * "小陀螺档平移明显不够快"。分离/跟随不放大，保持已验证的 0.20 m/s。
+ *
+ * ⚠️ 这个常量同时是**闸门 static_assert 的输入**（见 main_task.cpp）：
+ *    闸门 ≥ boost×(max_vx+max_vy) + (半轴距+半轮距)·max_spin_w
+ *    所以不要单独改它而不改闸门，否则自旋+平移会被等比削减。
+ * 运行期可用 g_spin_trans_boost 在 [1.0, 本值] 内调，改完记得写回这里。
+ */
+inline constexpr float kSpinTransBoostMax = 1.5f;
+
 /* Exported types ------------------------------------------------------------*/
 
 class Chassis
